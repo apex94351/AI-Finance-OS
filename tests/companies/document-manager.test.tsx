@@ -1,15 +1,17 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { createRequire } from "node:module";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DocumentRecord } from "@/services/documents";
 
-const { refresh, createDocumentDownloadUrl, deleteDocument, updateDocumentClassification, uploadDocument } = vi.hoisted(() => ({
+const { refresh, createDocumentDownloadUrl, deleteDocument, updateDocumentClassification, uploadDocument, uploadAction } = vi.hoisted(() => ({
   refresh: vi.fn(),
   createDocumentDownloadUrl: vi.fn(),
   deleteDocument: vi.fn(),
   updateDocumentClassification: vi.fn(),
   uploadDocument: vi.fn(),
+  uploadAction: vi.fn(),
 }));
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh }) }));
@@ -22,6 +24,9 @@ vi.mock("react", async (importOriginal) => {
 });
 
 import { DocumentManager } from "@/database/components/documents/document-manager";
+
+const jsdomRequire = createRequire(`${process.cwd()}/package.json`);
+const jsdomIdlUtils = jsdomRequire("jsdom/lib/generated/idl/utils.js");
 
 const documentRecord: DocumentRecord = {
   id: "d1",
@@ -43,6 +48,12 @@ const documentRecord: DocumentRecord = {
   }],
 };
 
+function setInputFiles(input: HTMLInputElement, ...files: File[]) {
+  const implementation = jsdomIdlUtils.implForWrapper(input.files);
+  if (!implementation) throw new Error("The input does not expose its jsdom FileList implementation.");
+  for (const file of files) implementation.push(jsdomIdlUtils.implForWrapper(file));
+}
+
 describe("document manager", () => {
   afterEach(() => {
     cleanup();
@@ -51,21 +62,114 @@ describe("document manager", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    useActionState.mockReturnValue([{}, vi.fn(), false]);
+    useActionState.mockReturnValue([{}, uploadAction, false]);
   });
 
-  it("shows real metadata, filters files and requests private signed URLs", async () => {
-    createDocumentDownloadUrl.mockResolvedValue({ url: "https://signed.example/document" });
+  it("routes the label click to the file input and submits its selected file through the existing form", async () => {
+    render(<DocumentManager companies={[{ id: "co1", name: "Atelier Alpha" }]} documents={[]} loadError={null} />);
+
+    const fileInput = screen.getByLabelText("Sélectionner un document PDF, JPG ou PNG") as HTMLInputElement;
+    const uploadLabel = screen.getByText("Importer un document", { selector: "label" }) as HTMLLabelElement;
+    expect(uploadLabel.htmlFor).toBe(fileInput.id);
+    expect(document.querySelectorAll(`#${fileInput.id}`)).toHaveLength(1);
+    expect(fileInput.form?.id).toBe("document-upload-form");
+    expect(screen.queryByRole("heading", { name: "Importer un document" })).toBeNull();
+    const inputClick = vi.fn();
+    fileInput.addEventListener("click", inputClick);
+    fireEvent.click(uploadLabel);
+    expect(inputClick).toHaveBeenCalledOnce();
+    expect(screen.getByRole("heading", { name: "Importer un document" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Fermer" }));
+    expect(screen.queryByRole("heading", { name: "Importer un document" })).toBeNull();
+    fireEvent.click(uploadLabel);
+    expect(screen.getByRole("heading", { name: "Importer un document" })).toBeTruthy();
+
+    const file = new File(["%PDF-1.7"], "invoice.pdf", { type: "application/pdf" });
+    setInputFiles(fileInput, file);
+    fireEvent.change(fileInput);
+    expect(screen.getByText("invoice.pdf")).toBeTruthy();
+    expect(fileInput.files?.length).toBe(1);
+    expect(fileInput.files?.item(0)?.name).toBe(file.name);
+    expect(fileInput.form?.id).toBe("document-upload-form");
+    const nativeFormFile = new FormData(fileInput.form!).get("file") as File;
+    expect(nativeFormFile.name).toBe(file.name);
+    expect(nativeFormFile.type).toBe(file.type);
+    expect(nativeFormFile.size).toBe(file.size);
+
+    fireEvent.submit(fileInput.form!);
+    await waitFor(() => expect(uploadAction).toHaveBeenCalled());
+    const submittedFile = uploadAction.mock.calls[0][0].get("file") as File;
+    expect(submittedFile.name).toBe(file.name);
+    expect(submittedFile.type).toBe(file.type);
+    expect(submittedFile.size).toBe(file.size);
+  });
+
+  it("keeps personal upload available without a company and disables uploads while pending", () => {
+    const { container, rerender } = render(<DocumentManager companies={[]} documents={[]} loadError={null} />);
+    const fileInput = screen.getByLabelText("Sélectionner un document PDF, JPG ou PNG") as HTMLInputElement;
+    expect(fileInput.disabled).toBe(false);
+    expect(container.querySelector(".document-upload-trigger-visual")?.classList.contains("disabled-button")).toBe(false);
+    fireEvent.click(screen.getByText("Importer un document", { selector: "label" }));
+    expect(screen.getByRole("heading", { name: "Importer un document" })).toBeTruthy();
+    expect((screen.getByRole("combobox", { name: "Espace de stockage" }) as HTMLSelectElement).value).toBe("");
+
+    useActionState.mockReturnValue([{}, uploadAction, true]);
+    rerender(<DocumentManager companies={[{ id: "co1", name: "Atelier Alpha" }]} documents={[]} loadError={null} />);
+    expect((screen.getByLabelText("Sélectionner un document PDF, JPG ou PNG") as HTMLInputElement).disabled).toBe(true);
+    expect(container.querySelector(".document-upload-trigger-visual")?.classList.contains("disabled-button")).toBe(true);
+  });
+
+  it("does not disable the file picker when metadata loading fails", () => {
+    render(<DocumentManager companies={[]} documents={[]} loadError="Table Documents indisponible" />);
+
+    const fileInput = screen.getByLabelText("Sélectionner un document PDF, JPG ou PNG") as HTMLInputElement;
+    expect(fileInput.disabled).toBe(false);
+    fireEvent.click(screen.getByText("Importer un document", { selector: "label" }));
+    expect(screen.getByRole("heading", { name: "Importer un document" })).toBeTruthy();
+    expect(screen.getByRole("alert").textContent).toContain("Table Documents indisponible");
+  });
+
+  it("opens a PDF in the integrated reader using a temporary authorized URL", async () => {
+    createDocumentDownloadUrl.mockResolvedValue({ url: "https://signed.example/document", fileType: "application/pdf" });
     render(<DocumentManager companies={[{ id: "co1", name: "Atelier Alpha" }]} documents={[documentRecord]} loadError={null} />);
 
     expect(screen.getByText("invoice.pdf")).toBeTruthy();
     expect(screen.getAllByText("Atelier Alpha").length).toBeGreaterThan(0);
-    fireEvent.change(screen.getByRole("searchbox", { name: "Rechercher un document" }), { target: { value: "absent" } });
-    expect(screen.getByText("Aucun résultat")).toBeTruthy();
-    fireEvent.change(screen.getByRole("searchbox", { name: "Rechercher un document" }), { target: { value: "" } });
-    fireEvent.click(screen.getByRole("button", { name: "Consulter" }));
+    fireEvent.click(screen.getByRole("button", { name: "Lire" }));
     await vi.waitFor(() => expect(createDocumentDownloadUrl).toHaveBeenCalledWith("co1", "d1"));
-    await vi.waitFor(() => expect(screen.getByRole("link", { name: "Ouvrir le document" }).getAttribute("href")).toBe("https://signed.example/document"));
+    const reader = await screen.findByRole("dialog", { name: "invoice.pdf" });
+    expect(within(reader).getByText("Facture client")).toBeTruthy();
+    expect(within(reader).getByTitle("Lecture de invoice.pdf").getAttribute("src")).toBe("https://signed.example/document");
+    fireEvent.click(within(reader).getByRole("button", { name: "Fermer le lecteur" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it.each(["image/jpeg", "image/png"] as const)("opens personal %s documents as proportion-preserving images", async (fileType) => {
+    const personalDocument = {
+      ...documentRecord,
+      companyId: null,
+      filePath: "user-id/personal/image",
+      fileName: fileType === "image/png" ? "scan.png" : "scan.jpg",
+      fileType,
+    };
+    createDocumentDownloadUrl.mockResolvedValue({ url: "https://signed.example/image", fileType });
+    render(<DocumentManager companies={[]} documents={[personalDocument]} loadError={null} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Lire" }));
+
+    const image = await screen.findByRole("img", { name: personalDocument.fileName });
+    expect(createDocumentDownloadUrl).toHaveBeenCalledWith(null, "d1");
+    expect(image.getAttribute("src")).toBe("https://signed.example/image");
+  });
+
+  it("shows a readable preview failure without exposing a storage path", async () => {
+    createDocumentDownloadUrl.mockResolvedValue({ error: "Ce document n’est pas accessible." });
+    render(<DocumentManager companies={[]} documents={[{ ...documentRecord, companyId: null }]} loadError={null} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Lire" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain("Ce document n’est pas accessible.");
+    expect(screen.queryByText(documentRecord.filePath)).toBeNull();
   });
 
   it("shows empty, missing-storage information and retryable errors", () => {
@@ -101,19 +205,18 @@ describe("document manager", () => {
     expect(refresh).toHaveBeenCalled();
   });
 
-  it("shows a loading state while preparing a signed document link", async () => {
-    let resolveDownload!: (value: { url: string }) => void;
+  it("shows a loading state while preparing the document reader", async () => {
+    let resolveDownload!: (value: { url: string; fileType: "application/pdf" }) => void;
     createDocumentDownloadUrl.mockImplementation(() => new Promise((resolve) => {
       resolveDownload = resolve;
     }));
     render(<DocumentManager companies={[{ id: "co1", name: "Atelier Alpha" }]} documents={[documentRecord]} loadError={null} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Consulter" }));
+    fireEvent.click(screen.getByRole("button", { name: "Lire" }));
 
-    const pendingButton = await screen.findByRole("button", { name: "Préparation du lien…" });
-    expect(pendingButton.hasAttribute("disabled")).toBe(true);
-    resolveDownload({ url: "https://signed.example/document" });
-    expect(await screen.findByRole("link", { name: "Ouvrir le document" })).toBeTruthy();
+    expect((await screen.findByRole("status")).textContent).toContain("Chargement du document");
+    resolveDownload({ url: "https://signed.example/document", fileType: "application/pdf" });
+    expect(await screen.findByTitle("Lecture de invoice.pdf")).toBeTruthy();
   });
 
   it("confirms successful deletion in the interface", async () => {

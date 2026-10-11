@@ -12,7 +12,7 @@ export const manualInvoiceSchema = z.object({
   vatRate: z.string().trim().regex(ratePattern, "Saisissez un taux de TVA entre 0 et 100."),
   issueDate: z.string().date("Saisissez une date d’émission valide."),
   dueDate: z.string().date("Saisissez une date d’échéance valide."),
-  status: z.enum(["draft", "pending", "paid", "overdue", "receivable"]),
+  status: z.enum(["pending", "paid", "overdue"]),
 }).superRefine((invoice, context) => {
   const rate = Number(invoice.vatRate.replace(",", "."));
   if (rate > 100) {
@@ -22,11 +22,11 @@ export const manualInvoiceSchema = z.object({
       message: "Le taux de TVA doit être compris entre 0 et 100.",
     });
   }
-  if (invoice.status !== "draft" && !invoice.invoiceNumber) {
+  if (!invoice.invoiceNumber) {
     context.addIssue({
       code: "custom",
       path: ["invoiceNumber"],
-      message: "Un numéro est requis pour une facture qui n’est pas en brouillon.",
+      message: "Un numéro de facture est requis.",
     });
   }
   if (invoice.dueDate < invoice.issueDate) {
@@ -67,14 +67,15 @@ export function calculateInvoiceAmounts(subtotal: string, vatRate: string): Calc
 }
 
 export function getPersistedInvoiceStatus(
-  status: ManualInvoiceInput["status"],
-  dueDate: string,
+  status: InvoiceStatus,
+  dueDate: string | null,
   currentDate = new Date(),
 ): InvoiceStatus | null {
   const today = currentDate.toISOString().slice(0, 10);
-  if (status === "overdue" && dueDate >= today) return null;
-  if (status === "pending" && dueDate < today) return "overdue";
-  return status;
+  if (status === "paid") return "paid";
+  if (status === "draft" || status === "cancelled") return null;
+  if (status === "overdue") return "overdue";
+  return dueDate && dueDate < today ? "overdue" : "pending";
 }
 
 export function formatInvoiceAmount(value: number | null): string {

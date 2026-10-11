@@ -2,7 +2,7 @@ export type SupportedDocumentType = "application/pdf" | "image/jpeg" | "image/pn
 
 export interface DocumentRecord {
   id: string;
-  companyId: string;
+  companyId: string | null;
   filePath: string;
   fileName: string;
   fileType: SupportedDocumentType;

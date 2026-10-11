@@ -8,6 +8,7 @@ import {
   getPersistedInvoiceStatus,
   manualInvoiceSchema,
 } from "@/services/manual-invoice";
+import type { InvoicePaymentStatus } from "@/types/invoice";
 
 export type InvoiceActionState = {
   error?: string;
@@ -268,26 +269,56 @@ export async function deleteInvoice(companyId: string | null, invoiceId: string)
   return { success: "La facture a été supprimée." };
 }
 
-export async function markInvoiceSettled(companyId: string | null, invoiceId: string): Promise<InvoiceActionState> {
+export async function updateInvoicePaymentStatus(
+  companyId: string | null,
+  invoiceId: string,
+  targetStatus: InvoicePaymentStatus,
+): Promise<InvoiceActionState> {
   if ((companyId && !uuidSchema.safeParse(companyId).success) || !uuidSchema.safeParse(invoiceId).success) {
     return { error: "La facture sélectionnée n’est pas valide." };
   }
 
-  const access = await getInvoiceAccess(companyId, "/due-dates");
+  const access = await getInvoiceAccess(companyId, "/invoices");
   if ("error" in access) return access;
 
+  const currentQuery = access.supabase.from("invoices")
+    .select("status, due_date")
+    .eq("id", invoiceId);
+  const scopedCurrentQuery = companyId
+    ? currentQuery.eq("company_id", companyId).is("user_id", null)
+    : currentQuery.eq("user_id", access.user.id).is("company_id", null);
+  const currentResult = await scopedCurrentQuery.maybeSingle();
+  if (currentResult.error) {
+    console.error("Invoice status lookup failed", { code: currentResult.error.code });
+    return { error: "Impossible de vérifier le statut actuel de cette facture." };
+  }
+  if (!currentResult.data) return { error: "La facture est introuvable ou vous ne disposez pas des droits nécessaires." };
+
+  const currentStatus = currentResult.data.status as string;
+  const editableStatuses = ["pending", "overdue", "receivable", "paid"];
+  if (!editableStatuses.includes(currentStatus)) {
+    return { error: "Cette facture ne peut pas changer de statut de paiement." };
+  }
+
+  const newStatus = targetStatus === "pending"
+    ? getPersistedInvoiceStatus("pending", currentResult.data.due_date) ?? "pending"
+    : targetStatus;
+  if (newStatus === currentStatus) {
+    return { success: "Le statut de la facture a été mis à jour." };
+  }
   const update = access.supabase
     .from("invoices")
-    .update({ status: "paid" })
+    .update({ status: newStatus })
     .eq("id", invoiceId)
-    .in("status", ["pending", "overdue", "receivable"]);
-  const result = companyId
-    ? await update.eq("company_id", companyId).is("user_id", null).select("id").maybeSingle()
-    : await update.eq("user_id", access.user.id).is("company_id", null).select("id").maybeSingle();
+    .eq("status", currentStatus);
+  const scopedUpdate = companyId
+    ? update.eq("company_id", companyId).is("user_id", null)
+    : update.eq("user_id", access.user.id).is("company_id", null);
+  const result = await scopedUpdate.select("id").maybeSingle();
   const { data, error } = result;
 
   if (error) {
-    console.error("Invoice settlement failed", { code: error.code });
+    console.error("Invoice status update failed", { code: error.code });
     return { error: "La mise à jour du statut a échoué. Vérifiez vos droits et réessayez." };
   }
   if (!data) return { error: "La facture est introuvable ou vous ne disposez pas des droits nécessaires." };
@@ -296,4 +327,8 @@ export async function markInvoiceSettled(companyId: string | null, invoiceId: st
   revalidatePath("/due-dates");
   revalidatePath("/dashboard");
   return { success: "Le statut de la facture a été mis à jour." };
+}
+
+export async function markInvoiceSettled(companyId: string | null, invoiceId: string): Promise<InvoiceActionState> {
+  return updateInvoicePaymentStatus(companyId, invoiceId, "paid");
 }

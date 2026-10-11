@@ -3,6 +3,7 @@ import {
   DOCUMENT_MAX_SIZE,
   filterDocuments,
   isDocumentStoragePathForCompany,
+  isDocumentStoragePathForUser,
   validateDocumentUpload,
   type DocumentRecord,
 } from "@/services/documents";
@@ -24,6 +25,14 @@ describe("document validation and filtering", () => {
     expect(isDocumentStoragePathForCompany("co1/../document.pdf", "co1")).toBe(false);
     expect(isDocumentStoragePathForCompany("co1//document.pdf", "co1")).toBe(false);
     expect(isDocumentStoragePathForCompany("co1\\document.pdf", "co1")).toBe(false);
+  });
+
+  it("validates personal storage paths with the same traversal protections", () => {
+    expect(isDocumentStoragePathForUser("user-1/personal/document.pdf", "user-1")).toBe(true);
+    expect(isDocumentStoragePathForUser("user-10/personal/document.pdf", "user-1")).toBe(false);
+    expect(isDocumentStoragePathForUser("user-1/../document.pdf", "user-1")).toBe(false);
+    expect(isDocumentStoragePathForUser("user-1//document.pdf", "user-1")).toBe(false);
+    expect(isDocumentStoragePathForUser("user-1/document.pdf", "user-1")).toBe(false);
   });
 
   it("accepts matching PDF, JPEG and PNG signatures and rejects invalid content", () => {

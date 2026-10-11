@@ -5,7 +5,7 @@ import { useActionState, useEffect, useState } from "react";
 import { createContact } from "@/app/contacts/actions";
 import { saveInvoice, type InvoiceActionState } from "@/app/invoices/actions";
 import { calculateInvoiceAmounts, formatInvoiceAmount } from "@/services/manual-invoice";
-import type { ContactKind, ContactRecord, InvoiceCompany, InvoiceRecord, InvoiceStatus } from "@/types/invoice";
+import type { ContactKind, ContactRecord, InvoiceCompany, InvoicePaymentStatus, InvoiceRecord, InvoiceStatus } from "@/types/invoice";
 
 const blankState: InvoiceActionState = {};
 type InvoiceSourceDocument = {
@@ -20,9 +20,8 @@ function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function editableStatus(status: InvoiceStatus | undefined): "draft" | "pending" | "paid" | "overdue" | "receivable" {
-  if (status === "draft" || status === "paid" || status === "overdue" || status === "receivable") return status;
-  return "pending";
+function editableStatus(status: InvoiceStatus | undefined): InvoicePaymentStatus {
+  return status === "paid" || status === "overdue" ? status : "pending";
 }
 
 export function InvoiceForm({
@@ -68,7 +67,7 @@ export function InvoiceForm({
     : sourceDocument ? "" : formatInvoiceAmount(0));
   const [vatRate, setVatRate] = useState(invoice?.vatRate?.toFixed(2) ?? (sourceDocument ? "" : "20"));
   const [status, setStatus] = useState(editableStatus(invoice?.status ?? (
-    sourceDocument?.category === "customer_invoice" ? "receivable" : "pending"
+    "pending"
   )));
   const calculated = calculateInvoiceAmounts(subtotal, vatRate);
   const selectedCompany = companies.find((company) => company.id === companyId);
@@ -220,8 +219,8 @@ export function InvoiceForm({
           <input name="clientName" value={clientName} onChange={(event) => setClientName(event.target.value)} maxLength={200} autoComplete="organization" readOnly={Boolean(selectedParty)} required />
         </label>
         <label className="invoice-field">
-          <span>Numéro de facture{status === "draft" ? "" : " *"}</span>
-          <input name="invoiceNumber" defaultValue={invoice?.invoiceNumber ?? ""} maxLength={80} placeholder="FAC-2026-001" required={status !== "draft"} />
+          <span>Numéro de facture *</span>
+          <input name="invoiceNumber" defaultValue={invoice?.invoiceNumber ?? ""} maxLength={80} placeholder="FAC-2026-001" required />
         </label>
         <label className="invoice-field invoice-field-wide">
           <span>Description</span>
@@ -250,11 +249,9 @@ export function InvoiceForm({
         <label className="invoice-field">
           <span>Statut</span>
           <select name="status" value={status} onChange={(event) => setStatus(event.target.value as typeof status)} required>
-            <option value="draft">Brouillon</option>
             <option value="pending">À payer</option>
             <option value="paid">Payée</option>
             <option value="overdue">En retard</option>
-            <option value="receivable">À recevoir</option>
           </select>
         </label>
       </div>

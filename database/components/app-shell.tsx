@@ -5,13 +5,11 @@ import { usePathname } from "next/navigation";
 import { useEffect, useMemo, useState, useTransition, type ReactNode } from "react";
 import {
   Bell,
-  Bot,
   Building2,
   CalendarClock,
   ChevronDown,
   CircleHelp,
   CreditCard,
-  FileChartColumn,
   FileText,
   Globe2,
   LayoutDashboard,
@@ -26,9 +24,7 @@ import {
   Sparkles,
   Sun,
   Users,
-  WalletCards,
   X,
-  Zap,
 } from "lucide-react";
 import { localeLabels, locales, messages, type Locale } from "@/i18n/messages";
 import { saveUserPreferences } from "@/app/settings/actions";
@@ -46,11 +42,11 @@ interface AppShellProps {
   initialTheme?: Theme;
 }
 
-const navigation: { group: keyof typeof messages.fr.groups; items: { key: keyof typeof messages.fr.nav; href: string; icon: Icon }[] }[] = [
-  { group: "main", items: [{ key: "home", href: "/dashboard", icon: LayoutDashboard }] },
-  { group: "finance", items: [{ key: "finance", href: "/finance", icon: WalletCards }, { key: "invoices", href: "/invoices", icon: ReceiptText }, { key: "expenses", href: "/expenses", icon: CreditCard }, { key: "revenue", href: "/revenue", icon: WalletCards }, { key: "dueDates", href: "/due-dates", icon: CalendarClock }] },
-  { group: "company", items: [{ key: "documents", href: "/documents", icon: FileText }, { key: "customers", href: "/clients", icon: Users }, { key: "suppliers", href: "/suppliers", icon: Building2 }, { key: "team", href: "/team", icon: Users }] },
-  { group: "intelligence", items: [{ key: "analytics", href: "/analytics", icon: FileChartColumn }, { key: "assistant", href: "/ai", icon: Bot }, { key: "aiCfo", href: "/ai-cfo", icon: Sparkles }, { key: "automations", href: "/automations", icon: Zap }] },
+const navigation: { group: keyof typeof messages.fr.groups; items: { key: keyof typeof messages.fr.nav; label?: string; href: string; icon: Icon }[] }[] = [
+  { group: "main", items: [{ key: "home", label: "Dashboard", href: "/dashboard", icon: LayoutDashboard }] },
+  { group: "finance", items: [{ key: "invoices", href: "/invoices", icon: ReceiptText }, { key: "expenses", href: "/expenses", icon: CreditCard }, { key: "dueDates", href: "/due-dates", icon: CalendarClock }] },
+  { group: "company", items: [{ key: "customers", href: "/clients", icon: Users }, { key: "suppliers", href: "/suppliers", icon: Building2 }, { key: "documents", href: "/documents", icon: FileText }] },
+  { group: "intelligence", items: [{ key: "aiCfo", href: "/ai-cfo", icon: Sparkles }] },
   { group: "system", items: [{ key: "settings", href: "/settings", icon: Settings }] },
 ];
 
@@ -179,10 +175,10 @@ export function AppShell({ children, pageTitle, userName = "Mon compte", initial
           {navigation.map((section) => (
             <div className="nav-section" key={section.group}>
               {!collapsed ? <p className="nav-section-label">{copy.groups[section.group]}</p> : null}
-              {section.items.map(({ key, href, icon: ItemIcon }) => {
+              {section.items.map(({ key, label, href, icon: ItemIcon }) => {
                 const active = pathname === href || (href !== "/dashboard" && pathname.startsWith(`${href}/`));
-                return <Link href={href} key={key} className={`workspace-nav-item ${active ? "is-active" : ""}`} onClick={() => setMobileOpen(false)} title={collapsed ? copy.nav[key] : undefined}>
-                  <ItemIcon size={18} strokeWidth={active ? 2.1 : 1.8} /><span>{copy.nav[key]}</span>
+                return <Link href={href} key={key} className={`workspace-nav-item ${active ? "is-active" : ""}`} onClick={() => setMobileOpen(false)} title={collapsed ? label ?? copy.nav[key] : undefined}>
+                  <ItemIcon size={18} strokeWidth={active ? 2.1 : 1.8} /><span>{label ?? copy.nav[key]}</span>
                 </Link>;
               })}
             </div>

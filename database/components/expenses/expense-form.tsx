@@ -12,6 +12,8 @@ const initialState: ExpenseActionState = {};
 export function ExpenseForm({
   companies,
   suppliers,
+  documents,
+  invoices,
   expense,
   initialCompanyId,
   today,
@@ -20,6 +22,8 @@ export function ExpenseForm({
 }: {
   companies: ExpenseCompany[];
   suppliers: ExpenseSupplier[];
+  documents: { id: string; user_id: string | null; company_id: string | null; file_name: string }[];
+  invoices: ExpenseRecord[];
   expense: ExpenseRecord | null;
   initialCompanyId: string;
   today: string;
@@ -33,6 +37,12 @@ export function ExpenseForm({
   const scopedSuppliers = useMemo(() => suppliers.filter((supplier) => (
     companyId ? supplier.company_id === companyId : supplier.company_id === null && supplier.user_id !== null
   )), [companyId, suppliers]);
+  const scopedDocuments = useMemo(() => documents.filter((document) => (
+    companyId ? document.company_id === companyId : document.company_id === null && document.user_id !== null
+  )), [companyId, documents]);
+  const scopedInvoices = useMemo(() => invoices.filter((invoice) => (
+    companyId ? invoice.companyId === companyId : invoice.companyId === null && invoice.userId !== null
+  )), [companyId, invoices]);
 
   useEffect(() => {
     if (state.success) onSaved();
@@ -63,8 +73,12 @@ export function ExpenseForm({
       )}
       <div className="invoice-form-grid">
         <label className="invoice-field invoice-field-wide"><span>Libellé</span><input name="label" defaultValue={expense?.label ?? ""} maxLength={200} required /></label>
-        <label className="invoice-field"><span>Montant ({selectedCompany?.currency ?? currency})</span><input name="amount" type="number" min="0.01" max="999999999999.99" step="0.01" defaultValue={expense?.amount ?? ""} required /></label>
-        <label className="invoice-field"><span>Date de dépense</span><input name="expenseDate" type="date" defaultValue={expense?.expenseDate ?? today} required /></label>
+        <label className="invoice-field"><span>Montant TTC ({selectedCompany?.currency ?? currency})</span><input name="amount" type="number" min="0.01" max="999999999999.99" step="0.01" defaultValue={expense?.amount ?? ""} required /></label>
+        <label className="invoice-field"><span>Montant HT (facultatif)</span><input name="subtotalHt" type="number" min="0" max="999999999999.99" step="0.01" defaultValue={expense?.subtotalHt ?? ""} /></label>
+        <label className="invoice-field"><span>Taux de TVA (facultatif)</span><input name="vatRate" type="number" min="0" max="100" step="0.01" defaultValue={expense?.vatRate ?? ""} /></label>
+        <label className="invoice-field"><span>TVA (facultatif)</span><input name="vatAmount" type="number" min="0" max="999999999999.99" step="0.01" defaultValue={expense?.vatAmount ?? ""} /></label>
+        <label className="invoice-field"><span>Date de dépense ou facture</span><input name="expenseDate" type="date" defaultValue={expense?.expenseDate ?? today} required /></label>
+        <label className="invoice-field"><span>Échéance (facultative)</span><input name="dueDate" type="date" defaultValue={expense?.dueDate ?? ""} /></label>
         <label className="invoice-field"><span>Catégorie</span><input name="category" defaultValue={expense?.category ?? ""} maxLength={100} placeholder="Saisir une catégorie" /></label>
         <label className="invoice-field">
           <span>Fournisseur (facultatif)</span>
@@ -73,9 +87,23 @@ export function ExpenseForm({
           </select>
         </label>
         <label className="invoice-field">
-          <span>Statut</span>
+          <span>Statut de paiement</span>
           <select name="status" defaultValue={expense?.status ?? "pending"}>
-            <option value="pending">À payer</option><option value="paid">Payée</option><option value="cancelled">Annulée</option>
+            <option value="pending">À payer</option><option value="paid">Payée</option><option value="overdue">En retard</option><option value="cancelled">Annulée</option>
+          </select>
+        </label>
+        <label className="invoice-field">
+          <span>Facture fournisseur liée (facultatif)</span>
+          <select name="invoiceId" defaultValue={expense?.invoiceId ?? ""}>
+            <option value="">Aucune facture liée</option>
+            {scopedInvoices.map((invoice) => <option value={invoice.invoiceId ?? invoice.id} key={invoice.id}>{invoice.label} · {invoice.supplierName ?? "Fournisseur"} · {invoice.amount.toFixed(2)} {invoice.currency}</option>)}
+          </select>
+        </label>
+        <label className="invoice-field">
+          <span>Justificatif existant (facultatif)</span>
+          <select name="documentId" defaultValue={expense?.documentId ?? ""}>
+            <option value="">Aucun justificatif</option>
+            {scopedDocuments.map((document) => <option value={document.id} key={document.id}>{document.file_name}</option>)}
           </select>
         </label>
         <label className="invoice-field invoice-field-wide"><span>Description ou notes</span><textarea name="notes" defaultValue={expense?.notes ?? ""} maxLength={2000} rows={3} /></label>

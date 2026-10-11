@@ -40,7 +40,7 @@ export const documentUploadMetadataSchema = z.object({
 
 export interface DocumentRecord {
   id: string;
-  companyId: string;
+  companyId: string | null;
   filePath: string;
   fileName: string;
   fileType: (typeof DOCUMENT_MIME_TYPES)[number];
@@ -67,7 +67,8 @@ export const documentClassificationSchema = z.object({
 
 export const documentRowSchema = z.object({
   id: z.uuid(),
-  company_id: z.uuid(),
+  user_id: z.uuid().nullable(),
+  company_id: z.uuid().nullable(),
   file_path: z.string().min(1),
   file_name: z.string().min(1),
   file_type: z.enum(DOCUMENT_MIME_TYPES),
@@ -76,7 +77,7 @@ export const documentRowSchema = z.object({
   deleted_at: z.string().nullable(),
   category: z.enum(DOCUMENT_CATEGORIES),
   document_status: z.enum(DOCUMENT_STATUSES),
-});
+}).refine((row) => (row.user_id === null) !== (row.company_id === null));
 
 export const documentInvoiceRowSchema = z.object({
   id: z.uuid(),
@@ -94,7 +95,16 @@ export const documentCompanySchema = z.object({
 export type DocumentCompany = z.infer<typeof documentCompanySchema>;
 
 export function isDocumentStoragePathForCompany(filePath: unknown, companyId: string): filePath is string {
-  if (typeof filePath !== "string" || !filePath.startsWith(`${companyId}/`)) return false;
+  return isDocumentStoragePathForOwner(filePath, companyId);
+}
+
+export function isDocumentStoragePathForUser(filePath: unknown, userId: string): filePath is string {
+  return isDocumentStoragePathForOwner(filePath, userId)
+    && filePath.split("/")[1] === "personal";
+}
+
+function isDocumentStoragePathForOwner(filePath: unknown, ownerId: string): filePath is string {
+  if (typeof filePath !== "string" || !filePath.startsWith(`${ownerId}/`)) return false;
   const pathSegments = filePath.split("/");
   return pathSegments.length >= 2
     && pathSegments.every((segment) => segment.length > 0 && segment !== "." && segment !== ".." && !segment.includes("\\"));

@@ -1,8 +1,9 @@
 import { z } from "zod";
 import { InvoiceManager } from "@/database/components/invoices/invoice-manager";
+import type { InvoiceDashboardFilter } from "@/database/components/invoices/invoice-manager";
 import { AppShell } from "@/database/components/app-shell";
 import { getAuthenticatedSupabase } from "@/lib/supabase/server";
-import { deriveInvoiceStatus } from "@/services/invoice-validation";
+import { getEffectiveInvoiceStatus } from "@/services/invoice-validation";
 import { contactRowSchema, mapContact } from "@/services/contacts";
 import type { ContactRecord, InvoiceCompany, InvoiceRecord } from "@/types/invoice";
 
@@ -102,9 +103,7 @@ function mapCompany(company: z.infer<typeof companySchema>[number]): InvoiceComp
 }
 
 function mapInvoice(invoice: z.infer<typeof invoiceSchema>[number]): InvoiceRecord {
-  const status = invoice.status === "pending" || invoice.status === "overdue"
-    ? deriveInvoiceStatus(invoice.due_date)
-    : invoice.status;
+  const status = getEffectiveInvoiceStatus(invoice.status, invoice.due_date);
   return {
     id: invoice.id,
     userId: invoice.user_id,
@@ -133,10 +132,22 @@ function mapInvoice(invoice: z.infer<typeof invoiceSchema>[number]): InvoiceReco
 export default async function InvoicesPage({
   searchParams,
 }: {
-  searchParams?: Promise<{ partyType?: string; partyId?: string; companyId?: string; documentId?: string }>;
+  searchParams?: Promise<{ partyType?: string; partyId?: string; companyId?: string; documentId?: string; dashboardFilter?: string; overviewPeriod?: string }>;
 } = {}) {
-  const { partyType, partyId, companyId, documentId } = searchParams ? await searchParams : {};
+  const { partyType, partyId, companyId, documentId, dashboardFilter, overviewPeriod } = searchParams ? await searchParams : {};
   const initialPartyType = partyType === "customer" || partyType === "supplier" ? partyType : undefined;
+  const dashboardFilters: InvoiceDashboardFilter[] = [
+    "customer-open",
+    "supplier-open",
+    "customer-invoices",
+    "customer-overdue",
+    "supplier-upcoming",
+    "all-overdue",
+  ];
+  const initialDashboardFilter = dashboardFilters.find((filter) => filter === dashboardFilter);
+  const initialOverviewPeriod = overviewPeriod === "month" || overviewPeriod === "year" || overviewPeriod === "all"
+    ? overviewPeriod
+    : undefined;
   const { supabase, user } = await getAuthenticatedSupabase("/invoices");
   const membershipResult = await supabase
     .from("company_members")
@@ -147,7 +158,7 @@ export default async function InvoicesPage({
     console.error("Invoice membership query failed", { code: membershipResult.error.code });
     return (
       <AppShell pageTitle="invoices">
-        <InvoiceManager companies={[]} contacts={[]} invoices={[]} loadError="Impossible de vérifier les espaces d’entreprise de votre compte." initialPartyType={initialPartyType} initialPartyId={partyId} />
+        <InvoiceManager companies={[]} contacts={[]} invoices={[]} loadError="Impossible de vérifier les espaces d’entreprise de votre compte." initialPartyType={initialPartyType} initialPartyId={partyId} initialDashboardFilter={initialDashboardFilter} />
       </AppShell>
     );
   }
@@ -157,7 +168,7 @@ export default async function InvoicesPage({
     console.error("Invoice membership query returned an unexpected result");
     return (
       <AppShell pageTitle="invoices">
-        <InvoiceManager companies={[]} contacts={[]} invoices={[]} loadError="La liste des espaces d’entreprise reçue est invalide." initialPartyType={initialPartyType} initialPartyId={partyId} />
+        <InvoiceManager companies={[]} contacts={[]} invoices={[]} loadError="La liste des espaces d’entreprise reçue est invalide." initialPartyType={initialPartyType} initialPartyId={partyId} initialDashboardFilter={initialDashboardFilter} />
       </AppShell>
     );
   }
@@ -173,7 +184,7 @@ export default async function InvoicesPage({
       console.error("Invoice company query failed", { code: companyResult.error.code });
       return (
         <AppShell pageTitle="invoices">
-          <InvoiceManager companies={[]} contacts={[]} invoices={[]} loadError="Impossible de charger les entreprises associées à votre compte." initialPartyType={initialPartyType} initialPartyId={partyId} />
+          <InvoiceManager companies={[]} contacts={[]} invoices={[]} loadError="Impossible de charger les entreprises associées à votre compte." initialPartyType={initialPartyType} initialPartyId={partyId} initialDashboardFilter={initialDashboardFilter} />
         </AppShell>
       );
     }
@@ -185,9 +196,36 @@ export default async function InvoicesPage({
     console.error("Invoice company query returned an unexpected result");
     return (
       <AppShell pageTitle="invoices">
-        <InvoiceManager companies={[]} contacts={[]} invoices={[]} loadError="Les informations d’entreprise reçues sont invalides." initialPartyType={initialPartyType} initialPartyId={partyId} />
+        <InvoiceManager companies={[]} contacts={[]} invoices={[]} loadError="Les informations d’entreprise reçues sont invalides." initialPartyType={initialPartyType} initialPartyId={partyId} initialDashboardFilter={initialDashboardFilter} />
       </AppShell>
     );
+  }
+
+  const accessibleCompanyIds = companies.data.map(({ id }) => id);
+  const asOfDate = new Date().toISOString().slice(0, 10);
+  const syncPersonalOverdue = await supabase
+    .from("invoices")
+    .update({ status: "overdue" })
+    .eq("user_id", user.id)
+    .is("company_id", null)
+    .in("status", ["pending", "receivable"])
+    .lt("due_date", asOfDate)
+    .not("due_date", "is", null);
+  if (syncPersonalOverdue.error) {
+    console.error("Personal overdue invoice synchronization failed", { code: syncPersonalOverdue.error.code });
+  }
+  if (accessibleCompanyIds.length > 0) {
+    const syncCompanyOverdue = await supabase
+      .from("invoices")
+      .update({ status: "overdue" })
+      .in("company_id", accessibleCompanyIds)
+      .is("user_id", null)
+      .in("status", ["pending", "receivable"])
+      .lt("due_date", asOfDate)
+      .not("due_date", "is", null);
+    if (syncCompanyOverdue.error) {
+      console.error("Company overdue invoice synchronization failed", { code: syncCompanyOverdue.error.code });
+    }
   }
 
   let contacts: ContactRecord[] = [];
@@ -243,12 +281,11 @@ export default async function InvoicesPage({
     logInvoiceQueryError("personal_invoices", personalInvoiceResult.error);
     return (
       <AppShell pageTitle="invoices">
-        <InvoiceManager companies={companies.data.map(mapCompany)} contacts={contacts} invoices={[]} loadError={databaseSchemaError(personalInvoiceResult.error.code)} contactWarning={contactWarning} initialPartyType={initialPartyType} initialPartyId={partyId} />
+        <InvoiceManager companies={companies.data.map(mapCompany)} contacts={contacts} invoices={[]} loadError={databaseSchemaError(personalInvoiceResult.error.code)} contactWarning={contactWarning} initialPartyType={initialPartyType} initialPartyId={partyId} initialDashboardFilter={initialDashboardFilter} />
       </AppShell>
     );
   }
 
-  const accessibleCompanyIds = companies.data.map(({ id }) => id);
   let companyInvoices: unknown[] = [];
   if (accessibleCompanyIds.length > 0) {
     const companyInvoiceResult = await supabase
@@ -261,7 +298,7 @@ export default async function InvoicesPage({
       logInvoiceQueryError("company_invoices", companyInvoiceResult.error);
       return (
         <AppShell pageTitle="invoices">
-          <InvoiceManager companies={companies.data.map(mapCompany)} contacts={contacts} invoices={[]} loadError={databaseSchemaError(companyInvoiceResult.error.code)} contactWarning={contactWarning} initialPartyType={initialPartyType} initialPartyId={partyId} />
+          <InvoiceManager companies={companies.data.map(mapCompany)} contacts={contacts} invoices={[]} loadError={databaseSchemaError(companyInvoiceResult.error.code)} contactWarning={contactWarning} initialPartyType={initialPartyType} initialPartyId={partyId} initialDashboardFilter={initialDashboardFilter} />
         </AppShell>
       );
     }
@@ -271,7 +308,7 @@ export default async function InvoicesPage({
   const parsedInvoices = invoiceSchema.safeParse([...personalInvoiceResult.data, ...companyInvoices]);
   if (!parsedInvoices.success) {
     console.error("Invoice query returned an unexpected result");
-    return <AppShell pageTitle="invoices"><InvoiceManager companies={companies.data.map(mapCompany)} contacts={contacts} invoices={[]} loadError="Les factures reçues ne sont pas au format attendu." contactWarning={contactWarning} initialPartyType={initialPartyType} initialPartyId={partyId} /></AppShell>;
+    return <AppShell pageTitle="invoices"><InvoiceManager companies={companies.data.map(mapCompany)} contacts={contacts} invoices={[]} loadError="Les factures reçues ne sont pas au format attendu." contactWarning={contactWarning} initialPartyType={initialPartyType} initialPartyId={partyId} initialDashboardFilter={initialDashboardFilter} /></AppShell>;
   }
 
   let sourceDocument: {
@@ -327,6 +364,8 @@ export default async function InvoicesPage({
         contactWarning={contactWarning}
         initialPartyType={initialPartyType}
         initialPartyId={partyId}
+        initialDashboardFilter={initialDashboardFilter}
+        initialOverviewPeriod={initialOverviewPeriod}
         initialCompanyId={companies.data.some(({ id }) => id === companyId) ? companyId : undefined}
         sourceDocument={sourceDocument}
         sourceDocumentError={sourceDocumentError}

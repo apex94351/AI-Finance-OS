@@ -71,10 +71,10 @@ describe("AI CFO deterministic analysis", () => {
 
   it("keeps payable, receivable, overdue, paid, and expense totals separated by currency", () => {
     const analysis = buildCFOAnalysis([
-      invoice("eur-payable", { total: 10, currency: "EUR" }),
-      invoice("usd-payable", { total: 20, currency: "USD" }),
-      invoice("receivable", { status: "receivable", total: 30, currency: "EUR" }),
-      invoice("late", { status: "overdue", total: 40, currency: "GBP", dueDate: "2026-01-01" }),
+      invoice("eur-payable", { supplierId: "supplier", total: 10, currency: "EUR" }),
+      invoice("usd-payable", { supplierId: "supplier", total: 20, currency: "USD" }),
+      invoice("receivable", { customerId: "customer", status: "receivable", total: 30, currency: "EUR" }),
+      invoice("late", { supplierId: "supplier", status: "overdue", total: 40, currency: "GBP", dueDate: "2026-01-01" }),
       invoice("paid", { status: "paid", total: 50, currency: "USD" }),
     ], [
       expense("expense-eur", { amount: 5 }),
@@ -82,7 +82,11 @@ describe("AI CFO deterministic analysis", () => {
       expense("expense-cancelled", { amount: 1000, status: "cancelled" }),
     ], "2026-01-10");
 
-    expect(analysis.pendingTotals).toEqual([{ currency: "EUR", amount: 10 }, { currency: "USD", amount: 20 }]);
+    expect(analysis.pendingTotals).toEqual([
+      { currency: "EUR", amount: 10 },
+      { currency: "GBP", amount: 40 },
+      { currency: "USD", amount: 20 },
+    ]);
     expect(analysis.receivableTotals).toEqual([{ currency: "EUR", amount: 30 }]);
     expect(analysis.overdueTotals).toEqual([{ currency: "GBP", amount: 40 }]);
     expect(analysis.paidTotals).toEqual([{ currency: "USD", amount: 50 }]);

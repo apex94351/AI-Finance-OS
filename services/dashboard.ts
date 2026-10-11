@@ -1,4 +1,6 @@
-import type { InvoiceRecord, InvoiceStatus } from "@/types/invoice";
+import type { InvoiceRecord } from "@/types/invoice";
+import type { ExpenseRecord } from "@/services/expenses";
+import { getEffectiveInvoiceStatus } from "@/services/invoice-validation";
 
 export interface CurrencyTotal {
   currency: string;
@@ -26,7 +28,39 @@ export interface DashboardSummary {
   recent: InvoiceRecord[];
 }
 
-const activeStatuses: InvoiceStatus[] = ["pending", "receivable", "overdue"];
+export type DashboardPeriod = "7d" | "1m" | "3m" | "6m" | "1y" | "custom";
+
+export interface DashboardDateRange {
+  startDate: string;
+  endDate: string;
+  valid: boolean;
+}
+
+export interface DashboardChartBucket {
+  date: string;
+  amount: number;
+}
+
+export type DashboardChartInterval = "day" | "week" | "month";
+
+export interface DashboardPaidExpenseSeries {
+  currency: string;
+  interval: DashboardChartInterval;
+  buckets: DashboardChartBucket[];
+}
+
+export interface DashboardCockpit {
+  receivableTotals: CurrencyTotal[];
+  payableTotals: CurrencyTotal[];
+  invoicedTotals: CurrencyTotal[];
+  expenseTotals: CurrencyTotal[];
+  overdueInvoices: InvoiceRecord[];
+  overdueCustomerInvoices: InvoiceRecord[];
+  upcomingSupplierInvoices: InvoiceRecord[];
+  upcomingInvoices: InvoiceRecord[];
+  paidExpenseSeries: DashboardPaidExpenseSeries[];
+}
+
 const dayMilliseconds = 86_400_000;
 
 function dateOrdinal(value: string | null): number | null {
@@ -53,6 +87,197 @@ function mapTotals(totals: Map<string, number>): CurrencyTotal[] {
     .map(([currency, amountInCents]) => ({ currency, amount: amountInCents / 100 }));
 }
 
+function validDate(value: string): boolean {
+  return dateOrdinal(value) !== null;
+}
+
+function dateFromOrdinal(value: number): string {
+  return new Date(value * dayMilliseconds).toISOString().slice(0, 10);
+}
+
+function addMonths(date: string, months: number): string {
+  const [year, month, day] = date.split("-").map(Number);
+  const firstOfTargetMonth = new Date(Date.UTC(year!, month! - 1 + months, 1));
+  const lastDay = new Date(Date.UTC(firstOfTargetMonth.getUTCFullYear(), firstOfTargetMonth.getUTCMonth() + 1, 0)).getUTCDate();
+  firstOfTargetMonth.setUTCDate(Math.min(day!, lastDay));
+  return firstOfTargetMonth.toISOString().slice(0, 10);
+}
+
+export function resolveDashboardDateRange(
+  period: DashboardPeriod,
+  asOfDate: string,
+  customStartDate?: string,
+  customEndDate?: string,
+): DashboardDateRange {
+  if (!validDate(asOfDate)) return { startDate: "", endDate: "", valid: false };
+  if (period === "custom") {
+    const valid = Boolean(customStartDate && customEndDate
+      && validDate(customStartDate)
+      && validDate(customEndDate)
+      && customStartDate <= customEndDate);
+    return {
+      startDate: customStartDate ?? "",
+      endDate: customEndDate ?? "",
+      valid,
+    };
+  }
+  const startDate = period === "7d"
+    ? dateFromOrdinal(dateOrdinal(asOfDate)! - 6)
+    : addMonths(asOfDate, period === "1m" ? -1 : period === "3m" ? -3 : period === "6m" ? -6 : -12);
+  return { startDate, endDate: asOfDate, valid: true };
+}
+
+function isCustomerInvoice(invoice: InvoiceRecord): boolean {
+  return Boolean(invoice.customerId)
+    || (!invoice.supplierId && invoice.partyLinksAvailable !== false && Boolean(invoice.clientName));
+}
+
+function isOpenInvoice(invoice: InvoiceRecord, asOfDate: string): boolean {
+  const status = getEffectiveInvoiceStatus(invoice.status, invoice.dueDate, new Date(`${asOfDate}T00:00:00Z`));
+  return status === "pending" || status === "overdue";
+}
+
+function invoiceBalance(invoice: InvoiceRecord, asOfDate: string): number | null {
+  if (!isOpenInvoice(invoice, asOfDate) || invoice.total === null || !Number.isFinite(invoice.total) || invoice.total <= 0) return null;
+  return invoice.total;
+}
+
+function addMoney(totals: Map<string, number>, amount: number | null, currency: string | null) {
+  if (amount === null || !Number.isFinite(amount) || !currency || !/^[A-Z]{3}$/.test(currency)) return;
+  totals.set(currency, (totals.get(currency) ?? 0) + Math.round(amount * 100));
+}
+
+function isWithinRange(date: string | null, range: DashboardDateRange): date is string {
+  return Boolean(range.valid && date && validDate(date) && date >= range.startDate && date <= range.endDate);
+}
+
+function bucketDate(date: string, range: DashboardDateRange): string {
+  const interval = getBucketInterval(range);
+  if (interval === "day") return date;
+  if (interval === "week") {
+    const dateOrdinalValue = dateOrdinal(date)!;
+    const startOrdinal = dateOrdinal(range.startDate)!;
+    return dateFromOrdinal(startOrdinal + Math.floor((dateOrdinalValue - startOrdinal) / 7) * 7);
+  }
+  return `${date.slice(0, 7)}-01`;
+}
+
+function getBucketInterval(range: DashboardDateRange): DashboardChartInterval {
+  const days = dateOrdinal(range.endDate)! - dateOrdinal(range.startDate)! + 1;
+  return days <= 31 ? "day" : days <= 100 ? "week" : "month";
+}
+
+function getBucketDates(range: DashboardDateRange): string[] {
+  const start = dateOrdinal(range.startDate);
+  const end = dateOrdinal(range.endDate);
+  if (!range.valid || start === null || end === null || start > end) return [];
+
+  if (getBucketInterval(range) !== "month") {
+    const step = getBucketInterval(range) === "day" ? 1 : 7;
+    const dates: string[] = [];
+    for (let ordinal = start; ordinal <= end; ordinal += step) {
+      dates.push(dateFromOrdinal(ordinal));
+    }
+    return dates;
+  }
+
+  const dates: string[] = [];
+  const [startYear, startMonth] = range.startDate.split("-").map(Number);
+  const [endYear, endMonth] = range.endDate.split("-").map(Number);
+  for (let year = startYear!; year <= endYear!; year += 1) {
+    const firstMonth = year === startYear ? startMonth! : 1;
+    const lastMonth = year === endYear ? endMonth! : 12;
+    for (let month = firstMonth; month <= lastMonth; month += 1) {
+      dates.push(`${year}-${String(month).padStart(2, "0")}-01`);
+    }
+  }
+  return dates;
+}
+
+export function buildDashboardCockpit(
+  invoices: InvoiceRecord[],
+  expenses: ExpenseRecord[],
+  range: DashboardDateRange,
+  asOfDate: string,
+): DashboardCockpit {
+  const receivableTotals = new Map<string, number>();
+  const payableTotals = new Map<string, number>();
+  const invoicedTotals = new Map<string, number>();
+  const expenseTotals = new Map<string, number>();
+  const paidExpenseBuckets = new Map<string, Map<string, number>>();
+  const todayOrdinal = dateOrdinal(asOfDate);
+  const overdueInvoices: InvoiceRecord[] = [];
+  const overdueCustomerInvoices: InvoiceRecord[] = [];
+  const upcomingSupplierInvoices: InvoiceRecord[] = [];
+  const upcomingInvoices: InvoiceRecord[] = [];
+
+  for (const invoice of invoices) {
+    const balance = invoiceBalance(invoice, asOfDate);
+    if (balance !== null) {
+      if (invoice.supplierId) addMoney(payableTotals, balance, invoice.currency);
+      else if (isCustomerInvoice(invoice)) addMoney(receivableTotals, balance, invoice.currency);
+
+      const dueOrdinal = dateOrdinal(invoice.dueDate);
+      if (dueOrdinal !== null && todayOrdinal !== null) {
+        if (dueOrdinal < todayOrdinal) {
+          overdueInvoices.push(invoice);
+          if (isCustomerInvoice(invoice)) overdueCustomerInvoices.push(invoice);
+        }
+        if (invoice.supplierId && dueOrdinal >= todayOrdinal && dueOrdinal - todayOrdinal <= 30) {
+          upcomingSupplierInvoices.push(invoice);
+        }
+        if ((invoice.supplierId || isCustomerInvoice(invoice))
+          && dueOrdinal >= todayOrdinal && dueOrdinal - todayOrdinal <= 30) upcomingInvoices.push(invoice);
+      }
+    }
+    if (invoice.status !== "draft" && invoice.status !== "cancelled"
+      && isCustomerInvoice(invoice) && isWithinRange(invoice.issueDate, range)) {
+      addMoney(invoicedTotals, invoice.total, invoice.currency);
+    }
+  }
+
+  for (const expense of expenses) {
+    if (expense.status === "cancelled" || !isWithinRange(expense.expenseDate, range)) continue;
+    addMoney(expenseTotals, expense.amount, expense.currency);
+    if (expense.status === "paid"
+      && Number.isFinite(expense.amount)
+      && expense.amount > 0
+      && /^[A-Z]{3}$/.test(expense.currency)) {
+      const key = bucketDate(expense.expenseDate, range);
+      const byCurrency = paidExpenseBuckets.get(expense.currency) ?? new Map<string, number>();
+      byCurrency.set(key, (byCurrency.get(key) ?? 0) + Math.round(expense.amount * 100));
+      paidExpenseBuckets.set(expense.currency, byCurrency);
+    }
+  }
+
+  const sortByDueDate = (left: InvoiceRecord, right: InvoiceRecord) =>
+    (left.dueDate ?? "").localeCompare(right.dueDate ?? "");
+  const bucketDates = getBucketDates(range);
+  const bucketInterval = getBucketInterval(range);
+  const paidExpenseSeries = [...paidExpenseBuckets]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([currency, buckets]) => ({
+      currency,
+      interval: bucketInterval,
+      buckets: bucketDates.map((date) => ({
+        date,
+        amount: (buckets.get(date) ?? 0) / 100,
+      })),
+    }));
+
+  return {
+    receivableTotals: mapTotals(receivableTotals),
+    payableTotals: mapTotals(payableTotals),
+    invoicedTotals: mapTotals(invoicedTotals),
+    expenseTotals: mapTotals(expenseTotals),
+    overdueInvoices: overdueInvoices.sort(sortByDueDate),
+    overdueCustomerInvoices: overdueCustomerInvoices.sort(sortByDueDate),
+    upcomingSupplierInvoices: upcomingSupplierInvoices.sort(sortByDueDate),
+    upcomingInvoices: upcomingInvoices.sort(sortByDueDate),
+    paidExpenseSeries,
+  };
+}
+
 function invoiceTimestamp(invoice: InvoiceRecord): number {
   const updated = Date.parse(invoice.updatedAt);
   const created = Date.parse(invoice.createdAt);
@@ -70,7 +295,8 @@ export function buildDashboardSummary(invoices: InvoiceRecord[], asOfDate: strin
   let toProcessCount = 0;
 
   for (const invoice of invoices) {
-    if (invoice.status === "draft") {
+    const status = getEffectiveInvoiceStatus(invoice.status, invoice.dueDate, new Date(`${asOfDate}T00:00:00Z`));
+    if (status === "draft") {
       actions.push({
         invoice,
         kind: "draft",
@@ -79,11 +305,11 @@ export function buildDashboardSummary(invoices: InvoiceRecord[], asOfDate: strin
       });
       continue;
     }
-    if (!activeStatuses.includes(invoice.status)) continue;
+    if (status !== "pending" && status !== "overdue") continue;
     toProcessCount += 1;
 
-    if (invoice.status === "pending") addCurrencyTotal(payableTotals, invoice);
-    if (invoice.status === "receivable") addCurrencyTotal(receivableTotals, invoice);
+    if (invoice.supplierId) addCurrencyTotal(payableTotals, invoice);
+    else if (isCustomerInvoice(invoice)) addCurrencyTotal(receivableTotals, invoice);
 
     const dueDay = dateOrdinal(invoice.dueDate);
     if (dueDay === null || today === null) {
@@ -105,9 +331,6 @@ export function buildDashboardSummary(invoices: InvoiceRecord[], asOfDate: strin
     if (daysUntilDue <= 7) upcomingCount += 1;
 
     const verificationReasons: string[] = [];
-    if (invoice.status === "overdue") {
-      verificationReasons.push("Statut « en retard » incohérent avec la date d’échéance");
-    }
     if (invoice.total === null || !Number.isFinite(invoice.total) || !invoice.currency || !/^[A-Z]{3}$/.test(invoice.currency)) {
       verificationReasons.push("Montant ou devise à vérifier");
     }

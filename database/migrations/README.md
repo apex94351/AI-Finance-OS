@@ -81,13 +81,23 @@ présence dans le dépôt ne confirme pas son application distante.
 Avant toute application, inspectez le schéma, l’état du bucket et toutes les
 policies Storage existantes. La migration force le bucket `documents` en privé
 et ajuste ses limites/types autorisés. Elle ne doit être appliquée
-manuellement qu’après vérification de son effet sur les usages distants. Le
-module actuel stocke dans un espace d’entreprise uniquement : le schéma
-`documents` existant ne permet pas un propriétaire personnel. Les documents
-sont consultés via des URL signées de courte durée. Une relation facture peut
-exister via `invoices.document_id`; les clients et fournisseurs ne sont exposés
-comme relations que via les identifiants de partie portés par cette facture.
-Le schéma actuel ne lie pas directement les documents aux dépenses ou devis.
+manuellement qu’après vérification de son effet sur les usages distants. Les
+migrations 001 et 010 imposent initialement un propriétaire entreprise.
+`013_personal_documents.sql` est une migration additive qui rend
+`company_id` nullable, ajoute `user_id`, impose un propriétaire unique par
+document et ajoute des policies RLS/Storage personnelles. Les documents
+d’entreprise restent inchangés. Les chemins personnels utilisent
+`<user UUID>/personal/<fichier>`; les policies entreprise excluent ce dossier,
+y compris si un UUID utilisateur correspondait à un UUID entreprise. Dans le
+cas standard, appliquez 010, puis 011, puis 013; si une migration antérieure
+fournit déjà un schéma et un bucket équivalents, vérifiez-les au préalable.
+Cette migration doit être inspectée puis appliquée manuellement; sa présence
+ici ne signifie pas qu’elle est appliquée à Supabase. Les documents sont
+consultés via des URL signées de courte durée.
+Une relation facture peut exister pour un document d’entreprise via
+`invoices.document_id`; les clients et fournisseurs ne sont exposés comme
+relations que via les identifiants de partie portés par cette facture. Le
+schéma ne lie pas directement les documents aux dépenses ou devis.
 
 `012_invoice_document_links.sql` ajoute une unicité sur le document source d’une
 facture et une clé étrangère restrictive composite qui impose la même entreprise
@@ -99,15 +109,261 @@ absents ou inter-entreprises. L’index unique empêche aussi les doubles créat
 concurrentes ; le code vérifie également le lien côté serveur. Cette migration
 n’a pas été appliquée à Supabase.
 
+L’import personnel ne fonctionnera qu’après inspection et application
+manuelle de `013_personal_documents.sql` sur le projet Supabase cible. Cette
+migration n’est exécutée ni par l’application ni par les tests.
+
+## Correction Supabase géré des automatisations (migration 016)
+
+Les diagnostics du projet cible ont confirmé que `public.expenses`,
+`public.invoices` et `public.documents` existent, que les deux tables
+`recurring_expenses` et `expense_payments` sont absentes, et que le rôle
+`postgres` n'est pas superutilisateur mais peut appeler
+`cron.schedule(text,text,text)`. Les migrations 014 et 015 historiques
+exigeaient `rolsuper = true`; 014 utilisait également `SET ROLE`. Une erreur
+pendant leur transaction annule leurs créations, ce qui explique les tables
+absentes.
+
+**Ne réappliquez pas les scripts historiques 014 ou 015.** Appliquez le fichier
+complet `016_supabase_managed_schedulers.sql` dans le SQL Editor Supabase, après
+avoir vérifié que les migrations métier 006, 008, 009, 010, 011, 012 et 013
+sont déjà installées. Le script est local uniquement et n'a pas été exécuté
+sur une base distante. Il crée/répare les colonnes, tables, contraintes,
+index, RLS, RPC et triggers nécessaires, puis remplace idempotemment les trois
+jobs nommés. Il n'exige ni rôle superutilisateur, ni `CREATE` sur `cron`, ni
+`SET ROLE`, et ne crée pas d'extension ni de rôle.
+
+Les fonctions planifiées sont détenues par le rôle qui applique la migration,
+utilisent `SECURITY DEFINER`, `search_path` vide et un `row_security` explicite.
+Le préflight exige les droits effectifs, la propriété nécessaire des tables,
+les signatures Cron exécutables et l'absence de jobs conflictuels détenus par
+un autre rôle/base. Il échoue explicitement si ces garanties ne sont pas
+réunies. Les fonctions de facture ne modifient que `pending`/`receivable`
+échues ; les fonctions de dépenses ne modifient que `pending` échues. Les
+occurrences récurrentes sont protégées par une contrainte unique et `ON
+CONFLICT DO NOTHING`.
+
+**Contenu SQL exact à exécuter :** le contenu intégral et inchangé de
+[`016_supabase_managed_schedulers.sql`](./016_supabase_managed_schedulers.sql),
+une fois, dans le SQL Editor du bon projet. Vérifiez l'absence d'erreur avant
+de considérer la migration appliquée. Les trois tâches doivent avoir ces
+noms et commandes :
+
+```sql
+select jobid, jobname, username, database, schedule, command
+from cron.job
+where jobname in (
+  'ai-finance-os-invoice-overdue-daily',
+  'ai-finance-os-recurring-expenses-daily',
+  'ai-finance-os-expenses-overdue-daily'
+)
+order by jobname;
+```
+
+Après application, contrôlez les exécutions et les fonctions :
+
+```sql
+select j.jobid, j.status, j.return_message, j.start_time, j.end_time
+from cron.job_run_details as j
+join cron.job as c on c.jobid = j.jobid
+where c.jobname in (
+  'ai-finance-os-invoice-overdue-daily',
+  'ai-finance-os-recurring-expenses-daily',
+  'ai-finance-os-expenses-overdue-daily'
+)
+order by j.start_time desc
+limit 30;
+
+select n.nspname, p.proname, r.rolname as owner, p.prosecdef, p.proconfig
+from pg_catalog.pg_proc as p
+join pg_catalog.pg_namespace as n on n.oid = p.pronamespace
+join pg_catalog.pg_roles as r on r.oid = p.proowner
+where n.nspname = 'public'
+  and p.proname in (
+    'update_overdue_invoice_statuses',
+    'update_overdue_expense_statuses',
+    'generate_due_recurring_expense_occurrences'
+  );
+```
+
+L'application de SQL distant reste une action manuelle à effectuer par vous ;
+aucune connexion ni mutation distante n'a été réalisée pendant cette correction.
+
+### Migrations 014/015 historiques — ne pas exécuter
+
+Les paragraphes historiques ci-dessous décrivent l'ancien mécanisme et sont
+conservés pour expliquer les changements. Ils ne constituent plus les
+instructions de déploiement. Utilisez uniquement 016 pour réparer les échecs
+et installer les trois tâches.
+
+## Migration historique 014 : mise à jour planifiée des factures
+
+L'ancien `014_invoice_overdue_scheduler.sql` préparait un job `pg_cron` nommé
+`ai-finance-os-invoice-overdue-daily`. Il met une fois par jour à 00:10 UTC
+uniquement les factures `pending` ou `receivable` dont l’échéance est avant la
+date UTC du jour au statut `overdue`. Les factures `paid`, `draft`, `cancelled`,
+les échéances nulles et les statuts inconnus ne sont pas modifiés. Le job
+exécute le `UPDATE` sous le rôle dédié non-login `invoice_overdue_scheduler`,
+avec RLS appliquée et privilèges de colonne limités à `status`; il n’emploie
+pas `service_role`. Le script ne crée pas l’extension `pg_cron`.
+
+Ce dépôt ne prouve ni que `pg_cron` est activé sur le projet Supabase cible ni
+que ce job est actif en production. Avant application, dans le projet cible,
+inspectez sans modifier :
+
+```sql
+select extname from pg_catalog.pg_extension where extname = 'pg_cron';
+select pg_catalog.to_regprocedure('cron.schedule(text,text,text)') as named_schedule,
+       pg_catalog.to_regprocedure('cron.unschedule(bigint)') as unschedule;
+select column_name, data_type, is_nullable
+from information_schema.columns
+where table_schema = 'public' and table_name = 'invoices'
+order by ordinal_position;
+select status::text, count(*) from public.invoices group by status::text order by status::text;
+select c.relrowsecurity
+from pg_catalog.pg_class c
+where c.oid = 'public.invoices'::regclass;
+select t.tgname, p.proname, pg_catalog.pg_get_triggerdef(t.oid)
+from pg_catalog.pg_trigger t
+join pg_catalog.pg_proc p on p.oid = t.tgfoid
+where t.tgrelid = 'public.invoices'::regclass and not t.tgisinternal;
+select jobid, jobname, username, database, schedule, command
+from cron.job
+where jobname = 'ai-finance-os-invoice-overdue-daily';
+```
+
+Vérifiez que le schéma et les statuts correspondent aux hypothèses de la
+migration et que les triggers ne créent pas d’effets secondaires. Ces
+instructions sont historiques : n'appliquez pas 014. Utilisez la migration
+corrective 016 à la place. Le script historique interrompt et annule sa
+transaction si ses pré-vérifications
+échouent ou si un job de même nom, mais de propriétaire/base/commande
+différents, est déjà présent. Une réexécution sous le même rôle vérifie puis
+remplace uniquement ce job nommé avec la commande attendue.
+
+Après application, contrôlez le résultat sans modifier de données :
+
+```sql
+select rolname, rolsuper, rolbypassrls, rolcanlogin, rolinherit
+from pg_catalog.pg_roles where rolname = 'invoice_overdue_scheduler';
+select table_schema, table_name, privilege_type
+from information_schema.role_table_grants
+where grantee = 'invoice_overdue_scheduler';
+select table_schema, table_name, column_name, privilege_type
+from information_schema.role_column_grants
+where grantee = 'invoice_overdue_scheduler';
+select policyname, permissive, roles, cmd, qual, with_check
+from pg_catalog.pg_policies
+where schemaname = 'public' and tablename = 'invoices'
+  and policyname like 'invoice_overdue_scheduler%';
+select jobid, jobname, username, database, schedule, command
+from cron.job
+where jobname = 'ai-finance-os-invoice-overdue-daily';
+select j.jobid, j.status, j.return_message, j.start_time, j.end_time
+from cron.job_run_details j
+join cron.job c on c.jobid = j.jobid
+where c.jobname = 'ai-finance-os-invoice-overdue-daily'
+order by j.start_time desc limit 20;
+```
+
+Confirmez que le compte planificateur ne possède que les privilèges de lecture
+sur `status`/`due_date` et de mise à jour de `status` sur `public.invoices`,
+qu’il est non-login et sans `BYPASSRLS`, et que les exécutions réussissent.
+Les permissions héritées de `PUBLIC` ainsi que les policies/triggers propres à
+la base cible doivent aussi être inspectées. Le cron met à jour les factures
+éligibles de façon idempotente. La synchronisation à l’ouverture de la page
+reste un mécanisme complémentaire, pas un remplacement du job.
+
+Pour désinstaller, en SQL Editor administrateur, retirez d’abord le job par son
+nom puis les policies dédiées et les grants/rôle après avoir confirmé qu’aucun
+autre job ne l’utilise :
+
+```sql
+select cron.unschedule(jobid)
+from cron.job
+where jobname = 'ai-finance-os-invoice-overdue-daily';
+drop policy if exists invoice_overdue_scheduler_select on public.invoices;
+drop policy if exists invoice_overdue_scheduler_select_cap on public.invoices;
+drop policy if exists invoice_overdue_scheduler_update on public.invoices;
+drop policy if exists invoice_overdue_scheduler_update_cap on public.invoices;
+revoke all privileges on table public.invoices from invoice_overdue_scheduler;
+revoke select (status, due_date), update (status)
+  on public.invoices from invoice_overdue_scheduler;
+revoke all privileges on schema public from invoice_overdue_scheduler;
+create or replace function public.set_invoice_updated_at()
+returns trigger
+language plpgsql
+set search_path = ''
+as $function$
+begin
+  new.updated_at := pg_catalog.now();
+  return new;
+end;
+$function$;
+drop role invoice_overdue_scheduler;
+```
+
+## Dépenses et récurrences
+
+`015_expense_operations.sql` est une migration historique, remplacée pour le
+déploiement par 016. Elle
+requiert les migrations `006`, `008`, `009`, `011`, `012` et `013`, ainsi que
+`pg_cron` avec `cron.schedule(text,text,text)`. Elle étend les dépenses avec
+échéances, HT/TVA et liens aux justificatifs/factures, crée l’historique des
+paiements et les modèles récurrents avec RLS et contrôles de cohérence.
+L’enregistrement d’un paiement passe par une RPC qui vérifie l’accès, verrouille
+la dépense et empêche les paiements supérieurs au solde. Les insertions directes
+dans `expense_payments` ne sont pas accordées aux utilisateurs authentifiés.
+
+La migration installe deux jobs `pg_cron` en UTC : `ai-finance-os-expenses-overdue-daily`
+à 00:20 met à jour les dépenses échues encore impayées, sans écraser les
+statuts manuels `overdue`; `ai-finance-os-recurring-expenses-daily` à 00:25
+génère les occurrences dues sans doublon. Les paiements complets restent
+`paid`, et l’application recalcule également le statut à l’affichage pour ne
+pas dépendre du prochain passage du cron. Le cron ne déclenche aucun paiement.
+Le module Échéances reprend les dépenses avec échéance, en excluant les
+dépenses liées à une facture déjà listée. « Payé ce mois-ci » ne compte que les
+paiements portant une date réelle ; le schéma historique des factures ne
+fournit pas de date de règlement fiable et ces factures payées ne sont donc pas
+ajoutées à cet indicateur.
+
+Avant toute application, inspectez les prérequis et les données dans le projet
+cible. N'appliquez pas 015 séparément : appliquez uniquement 016 comme décrit
+plus haut. Aucune migration n’a été appliquée sur Supabase distant. Les requêtes
+suivantes sont conservées comme référence historique :
+
+```sql
+select jobid, jobname, username, database, schedule, command
+from cron.job
+where jobname in (
+  'ai-finance-os-expenses-overdue-daily',
+  'ai-finance-os-recurring-expenses-daily'
+);
+select j.jobid, j.status, j.return_message, j.start_time, j.end_time
+from cron.job_run_details j
+join cron.job c on c.jobid = j.jobid
+where c.jobname in (
+  'ai-finance-os-expenses-overdue-daily',
+  'ai-finance-os-recurring-expenses-daily'
+)
+order by j.start_time desc limit 20;
+```
+
+La restauration de `set_invoice_updated_at()` ci-dessus convient uniquement si
+sa définition antérieure correspond à celle vérifiée par le préflight. Sinon,
+restaurez sa définition exacte depuis l’historique de migration de
+l’environnement. La migration 014 est préparée localement et n’a pas été
+exécutée sur Supabase.
+
 ## Architecture des données personnelles et partagées
 
 Les tables métier implémentées conservent une table unique avec une propriété
 de propriétaire exclusive (`user_id` ou `company_id`). Le stockage Documents
-existant ne prend en charge que la propriété d’entreprise. Le module AI CFO ne
-dispose pas encore de CRUD métier complet dans ce dépôt. Les échéances et
-alertes sont calculées à partir des factures ; les clients et fournisseurs
-utilisent leurs tables créées en migration 008. Ne rendez pas les nouvelles
-tables publiques et ajoutez des policies propres à chaque ligne.
+prend en charge les deux modes après application de la migration 013. Le module
+AI CFO ne dispose pas encore de CRUD métier complet dans ce dépôt. Les
+échéances et alertes sont calculées à partir des factures ; les clients et
+fournisseurs utilisent leurs tables créées en migration 008. Ne rendez pas les
+nouvelles tables publiques et ajoutez des policies propres à chaque ligne.
 
 ## Ancienne RPC de création d'entreprise
 

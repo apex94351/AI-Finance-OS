@@ -36,10 +36,13 @@ const companyId = "123e4567-e89b-42d3-a456-426614174000";
 
 function query(result: { data: unknown; error: Error | null }) {
   const builder = {
+    update: vi.fn(() => builder),
     select: vi.fn(() => builder),
     eq: vi.fn(() => builder),
     is: vi.fn(() => builder),
     in: vi.fn(() => builder),
+    lt: vi.fn(() => builder),
+    not: vi.fn(() => builder),
     order: vi.fn(() => Promise.resolve(result)),
     then: (resolve: (value: typeof result) => unknown, reject?: (reason: unknown) => unknown) =>
       Promise.resolve(result).then(resolve, reject),
@@ -55,7 +58,14 @@ function setup({ failCompanyInvoices = false }: { failCompanyInvoices?: boolean 
     ? { data: null, error: privateDiagnostic }
     : { data: [], error: null };
   const companyRows = [{ id: companyId, name: "Entreprise", currency: "EUR" }];
-  const invoiceQueries = [query(personalResult), query(companyResult)];
+  const invoiceQueries = failCompanyInvoices
+    ? [
+      query({ data: null, error: null }),
+      query({ data: null, error: null }),
+      query(personalResult),
+      query(companyResult),
+    ]
+    : [query({ data: null, error: null }), query(personalResult)];
 
   from.mockImplementation((table: string) => {
     if (table === "company_members") {

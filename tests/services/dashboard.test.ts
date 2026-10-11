@@ -30,9 +30,9 @@ function invoice(id: string, overrides: Partial<InvoiceRecord> = {}): InvoiceRec
 describe("dashboard summary", () => {
   it("groups payable, receivable and overdue totals by currency", () => {
     const summary = buildDashboardSummary([
-      invoice("pay-eur", { total: 100, currency: "EUR" }),
-      invoice("pay-usd", { total: 30, currency: "USD" }),
-      invoice("receive-eur", { status: "receivable", total: 40 }),
+      invoice("pay-eur", { supplierId: "supplier", total: 100, currency: "EUR" }),
+      invoice("pay-usd", { supplierId: "supplier", total: 30, currency: "USD" }),
+      invoice("receive-eur", { customerId: "customer", status: "receivable", total: 40 }),
       invoice("late-unknown", { status: "overdue", dueDate: "2026-10-09", total: 5, currency: "GBP" }),
       invoice("paid", { status: "paid", total: 900 }),
     ], "2026-10-10");
@@ -41,7 +41,10 @@ describe("dashboard summary", () => {
       { currency: "EUR", amount: 100 },
       { currency: "USD", amount: 30 },
     ]);
-    expect(summary.receivableTotals).toEqual([{ currency: "EUR", amount: 40 }]);
+    expect(summary.receivableTotals).toEqual([
+      { currency: "EUR", amount: 40 },
+      { currency: "GBP", amount: 5 },
+    ]);
     expect(summary.overdueTotals).toEqual([{ currency: "GBP", amount: 5 }]);
     expect(summary.toProcessCount).toBe(4);
   });
@@ -62,7 +65,7 @@ describe("dashboard summary", () => {
 
   it("sorts the most overdue items before nearer and verification actions", () => {
     const summary = buildDashboardSummary([
-      invoice("verify", { status: "overdue", dueDate: "2026-10-15" }),
+      invoice("verify", { status: "overdue", dueDate: "2026-10-15", currency: null }),
       invoice("near", { dueDate: "2026-10-12" }),
       invoice("late-2", { dueDate: "2026-10-08" }),
       invoice("late-5", { status: "receivable", dueDate: "2026-10-05" }),
@@ -75,8 +78,8 @@ describe("dashboard summary", () => {
 
   it("handles missing dates and currency without producing false sums", () => {
     const summary = buildDashboardSummary([
-      invoice("missing-date", { dueDate: null, total: null, currency: null }),
-      invoice("bad-date", { dueDate: "2026-02-30", total: 10, currency: "EUR" }),
+      invoice("missing-date", { supplierId: "supplier", dueDate: null, total: null, currency: null }),
+      invoice("bad-date", { supplierId: "supplier", dueDate: "2026-02-30", total: 10, currency: "EUR" }),
     ], "2026-10-10");
 
     expect(summary.actions.map(({ kind }) => kind)).toEqual(["verify", "verify"]);

@@ -2,10 +2,12 @@ import { z } from "zod";
 import { DashboardClient } from "@/database/components/dashboard/dashboard-client";
 import { AppShell } from "@/database/components/app-shell";
 import { getAuthenticatedSupabase } from "@/lib/supabase/server";
+import { expenseRowSchema } from "@/services/expenses";
+import { getEffectiveInvoiceStatus } from "@/services/invoice-validation";
 import type { InvoiceRecord } from "@/types/invoice";
 
 const membershipSchema = z.array(z.object({ company_id: z.uuid() }));
-const companySchema = z.array(z.object({ id: z.uuid(), name: z.string() }));
+const companySchema = z.array(z.object({ id: z.uuid(), name: z.string(), currency: z.string().regex(/^[A-Z]{3}$/) }));
 const amountSchema = z.union([
   z.number(),
   z.string().regex(/^-?\d+(?:\.\d+)?$/).transform(Number),
@@ -33,6 +35,22 @@ const invoiceSchema = z.array(z.object({
 const invoiceColumns = "id, user_id, company_id, invoice_number, client_name, description, issue_date, due_date, subtotal_ht, vat_amount, total_ttc, currency, status, created_at, updated_at";
 const invoiceColumnsWithParties = `${invoiceColumns}, customer_id, supplier_id`;
 const contactNamesSchema = z.array(z.object({ id: z.uuid(), name: z.string() }));
+const dashboardExpenseSchema = expenseRowSchema.pick({
+  id: true,
+  user_id: true,
+  company_id: true,
+  label: true,
+  amount: true,
+  currency: true,
+  expense_date: true,
+  category: true,
+  supplier_id: true,
+  status: true,
+  notes: true,
+  created_at: true,
+  updated_at: true,
+});
+const expenseColumns = "id, user_id, company_id, label, amount, currency, expense_date, category, supplier_id, status, notes, created_at, updated_at";
 type AuthenticatedSupabase = Awaited<ReturnType<typeof getAuthenticatedSupabase>>["supabase"];
 
 async function queryInvoices(
@@ -63,7 +81,8 @@ async function queryInvoices(
   };
 }
 
-function mapInvoice(invoice: z.infer<typeof invoiceSchema>[number]): InvoiceRecord {
+function mapInvoice(invoice: z.infer<typeof invoiceSchema>[number], asOfDate: string): InvoiceRecord {
+  const status = getEffectiveInvoiceStatus(invoice.status, invoice.due_date, new Date(`${asOfDate}T00:00:00Z`));
   return {
     id: invoice.id,
     userId: invoice.user_id,
@@ -81,7 +100,7 @@ function mapInvoice(invoice: z.infer<typeof invoiceSchema>[number]): InvoiceReco
     vatAmount: invoice.vat_amount,
     total: invoice.total_ttc,
     currency: invoice.currency,
-    status: invoice.status,
+    status,
     category: null,
     analysis: null,
     createdAt: invoice.created_at,
@@ -113,7 +132,7 @@ export default async function DashboardPage() {
   if (companyIds.length) {
     const companyResult = await supabase
       .from("companies")
-      .select("id, name")
+      .select("id, name, currency")
       .in("id", companyIds);
     if (companyResult.error) {
       console.error("Dashboard company query failed", { code: companyResult.error.code });
@@ -151,7 +170,15 @@ export default async function DashboardPage() {
     return <AppShell pageTitle="home"><DashboardClient invoices={[]} loadError="Les factures reçues ne sont pas au format attendu." asOfDate={asOfDate} /></AppShell>;
   }
 
-  const invoices = parsedInvoices.data.map(mapInvoice);
+  const companyCurrency = new Map(companies.data.map(({ id, currency }) => [id, currency]));
+  const invoices = parsedInvoices.data.map((row) => {
+    const invoice = mapInvoice(row, asOfDate);
+    return {
+      ...invoice,
+      partyLinksAvailable: invoice.companyId ? companyRowsHavePartyLinks : personalResult.hasPartyLinks,
+      currency: invoice.currency ?? companyCurrency.get(invoice.companyId ?? "") ?? null,
+    };
+  });
   const linkedCustomerIds = [...new Set(invoices.flatMap(({ customerId }) => customerId ? [customerId] : []))];
   const linkedSupplierIds = [...new Set(invoices.flatMap(({ supplierId }) => supplierId ? [supplierId] : []))];
   const [customers, suppliers] = await Promise.all([
@@ -179,13 +206,64 @@ export default async function DashboardPage() {
     partialDataWarning = "Les associations Clients/Fournisseurs ne sont pas disponibles dans le schéma chargé.";
   }
 
+  const personalExpenseResult = await supabase.from("expenses")
+    .select(expenseColumns)
+    .eq("user_id", user.id)
+    .is("company_id", null)
+    .order("expense_date", { ascending: false });
+  const companyExpenseResult = companyIds.length
+    ? await supabase.from("expenses")
+      .select(expenseColumns)
+      .in("company_id", companyIds)
+      .is("user_id", null)
+      .order("expense_date", { ascending: false })
+    : { data: [], error: null };
+  const expenseQueryError = personalExpenseResult.error ?? companyExpenseResult.error;
+  let expenses: z.infer<typeof dashboardExpenseSchema>[] = [];
+  let expensesLoadError: string | null = null;
+  if (expenseQueryError) {
+    console.error("Dashboard expense query failed", { code: expenseQueryError.code });
+    expensesLoadError = ["42P01", "42703", "PGRST204", "PGRST205"].includes(expenseQueryError.code ?? "")
+      ? "Les dépenses sont indisponibles dans le schéma chargé."
+      : "Impossible de charger les dépenses.";
+  } else {
+    const parsedExpenses = dashboardExpenseSchema.array().safeParse([
+      ...(personalExpenseResult.data ?? []),
+      ...(companyExpenseResult.data ?? []),
+    ]);
+    if (!parsedExpenses.success) {
+      console.error("Dashboard expense query returned an unexpected result");
+      expensesLoadError = "Les dépenses reçues ne sont pas au format attendu.";
+    } else {
+      expenses = parsedExpenses.data;
+    }
+  }
+
   return (
     <AppShell pageTitle="home">
       <DashboardClient
         invoices={invoices}
+        expenses={expenses.map((expense) => ({
+          id: expense.id,
+          userId: expense.user_id,
+          companyId: expense.company_id,
+          label: expense.label,
+          amount: typeof expense.amount === "number" ? expense.amount : Number(expense.amount),
+          currency: expense.currency,
+          expenseDate: expense.expense_date,
+          category: expense.category,
+          supplierId: expense.supplier_id,
+          supplierName: null,
+          status: expense.status,
+          notes: expense.notes,
+          createdAt: expense.created_at,
+          updatedAt: expense.updated_at,
+        }))}
         companies={companies.data}
         counterpartyNames={counterpartyNames}
+        partyLinksAvailable={personalResult.hasPartyLinks && companyRowsHavePartyLinks}
         loadError={null}
+        expensesLoadError={expensesLoadError}
         partialDataWarning={partialDataWarning}
         asOfDate={asOfDate}
       />

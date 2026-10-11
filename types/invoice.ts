@@ -1,6 +1,7 @@
 import type { InvoiceAnalysisResult } from "@/lib/ai/types";
 
 export type InvoiceStatus = "draft" | "pending" | "paid" | "overdue" | "receivable" | "cancelled";
+export type InvoicePaymentStatus = Extract<InvoiceStatus, "pending" | "paid" | "overdue">;
 
 export interface InvoiceRecord {
   id: string;
@@ -8,6 +9,7 @@ export interface InvoiceRecord {
   companyId: string | null;
   customerId?: string | null;
   supplierId?: string | null;
+  partyLinksAvailable?: boolean;
   documentId: string | null;
   invoiceNumber: string | null;
   clientName: string | null;

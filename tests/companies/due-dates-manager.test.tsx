@@ -1,142 +1,117 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, describe, expect, it } from "vitest";
 import type { DueDateRecord } from "@/services/due-dates";
-
-const { refresh, markInvoiceSettled } = vi.hoisted(() => ({
-  refresh: vi.fn(),
-  markInvoiceSettled: vi.fn(),
-}));
-
-vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh }) }));
-vi.mock("@/app/invoices/actions", () => ({ markInvoiceSettled }));
-
 import { DeadlineManager } from "@/database/components/due-dates/deadline-manager";
 
-const invoices: DueDateRecord[] = [
+const items: DueDateRecord[] = [
   {
-    id: "upcoming",
+    id: "invoice-overdue",
     companyId: null,
-    invoiceNumber: "FAC-2026-001",
+    customerId: "customer-1",
+    invoiceNumber: "CLI-2026-001",
     clientName: "Client Exemple",
-    dueDate: "2026-10-15",
+    dueDate: "2026-10-08",
     total: 120,
+    currency: "EUR",
+    status: "overdue",
+  },
+  {
+    id: "supplier-invoice",
+    companyId: "123e4567-e89b-42d3-a456-426614174000",
+    supplierId: "supplier-1",
+    invoiceNumber: "SUP-2026-002",
+    clientName: "Fournisseur Exemple",
+    dueDate: "2026-10-15",
+    total: 80,
     currency: "EUR",
     status: "pending",
   },
   {
-    id: "receivable",
-    companyId: "123e4567-e89b-42d3-a456-426614174000",
-    invoiceNumber: "FAC-2026-002",
-    clientName: "Client à encaisser",
-    dueDate: "2026-10-08",
-    total: 80,
-    currency: "USD",
-    status: "receivable",
+    id: "partially-paid-expense",
+    sourceType: "expense",
+    companyId: null,
+    supplierId: "supplier-2",
+    invoiceNumber: null,
+    clientName: "Hébergement",
+    label: "Cloud annuel",
+    dueDate: "2026-10-20",
+    total: 75,
+    grossTotal: 100,
+    paidAmount: 25,
+    currency: "EUR",
+    status: "pending",
   },
 ];
 
 describe("deadline manager", () => {
   afterEach(cleanup);
 
-  beforeEach(() => {
-    vi.clearAllMocks();
-    markInvoiceSettled.mockResolvedValue({ success: "Le statut a été mis à jour." });
-  });
+  it("shows the three euro indicators and explains the forecast balance", () => {
+    render(
+      <DeadlineManager
+        invoices={items}
+        counterpartyNames={{ "customer-1": "Client Exemple", "supplier-1": "Fournisseur Exemple", "supplier-2": "Hébergement" }}
+        loadError={null}
+        asOfDate="2026-10-10"
+      />,
+    );
 
-  it("shows actual upcoming and overdue items, their amounts, dates and invoice links", () => {
-    render(<DeadlineManager invoices={invoices} loadError={null} asOfDate="2026-10-10" />);
-
-    expect(screen.getByText("Dans 5 jours")).toBeTruthy();
-    expect(screen.getByText("En retard de 2 jours")).toBeTruthy();
+    expect(screen.getByText("Total à encaisser")).toBeTruthy();
+    expect(screen.getByText("Total à payer")).toBeTruthy();
+    expect(screen.getByText("Solde prévisionnel")).toBeTruthy();
     expect(screen.getByText(/120,00/)).toBeTruthy();
-    expect(screen.getByText(/80,00/)).toBeTruthy();
-    expect(screen.getAllByRole("link", { name: /Voir la facture/ })
-      .some((link) => link.getAttribute("href") === "/invoices#invoice-upcoming")).toBe(true);
+    expect(screen.getByText(/155,00/)).toBeTruthy();
+    expect(screen.getByText(/35,00/)).toBeTruthy();
+    expect(screen.getByText(/ne représente pas le solde bancaire réel/)).toBeTruthy();
   });
 
-  it("filters upcoming and overdue items separately", () => {
-    render(<DeadlineManager invoices={invoices} loadError={null} asOfDate="2026-10-10" />);
+  it("exposes exactly the requested filters and retains late obligations in all", () => {
+    render(<DeadlineManager invoices={items} loadError={null} asOfDate="2026-10-10" />);
 
-    fireEvent.click(screen.getByRole("button", { name: "À venir" }));
-    expect(screen.getByText(/Facture FAC-2026-001/)).toBeTruthy();
-    expect(screen.queryByText(/Facture FAC-2026-002/)).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: "En retard" }));
-    expect(screen.queryByText(/Facture FAC-2026-001/)).toBeNull();
-    expect(screen.getByText(/Facture FAC-2026-002/)).toBeTruthy();
+    const filterGroup = screen.getByRole("group", { name: "Type d’échéance" });
+    const buttons = within(filterGroup).getAllByRole("button");
+    expect(buttons.map((button) => button.textContent)).toEqual(["Toutes", "À payer", "À encaisser"]);
+    expect(screen.getByText("En retard")).toBeTruthy();
+    fireEvent.click(within(filterGroup).getByRole("button", { name: "À encaisser" }));
+    expect(screen.getByText("Client Exemple")).toBeTruthy();
+    expect(screen.queryByText("Fournisseur Exemple")).toBeNull();
+    fireEvent.click(within(filterGroup).getByRole("button", { name: "Toutes" }));
+    expect(screen.getByText("Fournisseur Exemple")).toBeTruthy();
   });
 
-  it("filters by period and payable/receivable direction", () => {
-    render(<DeadlineManager invoices={[
-      ...invoices,
-      {
-        id: "later",
-        companyId: null,
-        invoiceNumber: "FAC-LATER",
-        clientName: "Client futur",
-        dueDate: "2026-11-20",
-        total: 500,
-        currency: "EUR",
-        status: "pending",
-      },
-    ]} loadError={null} asOfDate="2026-10-10" />);
+  it("searches by client, supplier, or invoice reference and links to the source record", () => {
+    render(
+      <DeadlineManager
+        invoices={items}
+        counterpartyNames={{ "customer-1": "Client Exemple", "supplier-1": "Fournisseur Exemple", "supplier-2": "Hébergement" }}
+        loadError={null}
+        asOfDate="2026-10-10"
+      />,
+    );
 
-    fireEvent.change(screen.getByRole("combobox", { name: "Filtrer par période" }), { target: { value: "next7" } });
-    expect(screen.getByText(/Facture FAC-2026-001/)).toBeTruthy();
-    expect(screen.queryByText(/Facture FAC-LATER/)).toBeNull();
-    fireEvent.change(screen.getByRole("combobox", { name: "Filtrer par période" }), { target: { value: "all" } });
-    fireEvent.change(screen.getByRole("combobox", { name: "Filtrer par sens" }), { target: { value: "receivable" } });
-    expect(screen.getByText(/Facture FAC-2026-002/)).toBeTruthy();
-    expect(screen.queryByText(/Facture FAC-2026-001/)).toBeNull();
+    fireEvent.change(screen.getByRole("searchbox", { name: "Rechercher une échéance" }), {
+      target: { value: "SUP-2026-002" },
+    });
+    expect(screen.getByText("Fournisseur Exemple")).toBeTruthy();
+    expect(screen.queryByText("Client Exemple")).toBeNull();
+    expect(screen.getByRole("link", { name: /SUP-2026-002/ }).getAttribute("href")).toBe("/invoices#invoice-supplier-invoice");
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Rechercher une échéance" }), {
+      target: { value: "Hébergement" },
+    });
+    expect(screen.getByRole("link", { name: /Dépense · Cloud annuel/ }).getAttribute("href")).toBe("/expenses");
   });
 
-  it("persists settlement and refreshes the current data", async () => {
-    render(<DeadlineManager invoices={invoices} loadError={null} asOfDate="2026-10-10" />);
-    fireEvent.click(screen.getByRole("button", { name: "Marquer payée" }));
-
-    expect(markInvoiceSettled).toHaveBeenCalledWith(null, "upcoming");
-    await vi.waitFor(() => expect(refresh).toHaveBeenCalled());
-  });
-
-  it("shows a clear empty state and errors returned by the server action", async () => {
+  it("shows useful empty, loading-error, and partial-data messages", () => {
     const { rerender } = render(<DeadlineManager invoices={[]} loadError={null} asOfDate="2026-10-10" />);
-    expect(screen.getByText("Aucune échéance enregistrée")).toBeTruthy();
-    expect(screen.getByText(/brouillon ou annulées/)).toBeTruthy();
+    expect(screen.getByText("Aucune échéance active")).toBeTruthy();
 
-    markInvoiceSettled.mockResolvedValue({ error: "La mise à jour du statut a échoué." });
-    rerender(<DeadlineManager invoices={invoices} loadError={null} asOfDate="2026-10-10" />);
-    fireEvent.click(screen.getByRole("button", { name: "Marquer payée" }));
-    await vi.waitFor(() => expect(screen.getByRole("alert").textContent).toContain("mise à jour du statut"));
-  });
+    rerender(<DeadlineManager invoices={[]} loadError="Chargement impossible." asOfDate="2026-10-10" />);
+    expect(screen.getByRole("alert").textContent).toContain("Chargement impossible");
 
-  it("shows incomplete amounts without treating missing dates as due dates", () => {
-    render(<DeadlineManager invoices={[
-      {
-        id: "missing-date",
-        companyId: null,
-        invoiceNumber: "FAC-NO-DATE",
-        clientName: "Client sans date",
-        dueDate: null,
-        total: null,
-        currency: null,
-        status: "pending",
-      },
-      {
-        id: "missing-amount",
-        companyId: null,
-        invoiceNumber: "FAC-NO-AMOUNT",
-        clientName: "Client sans montant",
-        dueDate: "2026-10-11",
-        total: null,
-        currency: null,
-        status: "pending",
-      },
-    ]} loadError={null} asOfDate="2026-10-10" />);
-
-    expect(screen.getByText("Montant/devise à vérifier")).toBeTruthy();
-    expect(screen.queryByText(/Facture FAC-NO-DATE/)).toBeNull();
-    expect(screen.getByRole("link", { name: /Voir la facture/ }).getAttribute("href")).toBe("/invoices#invoice-missing-amount");
+    rerender(<DeadlineManager invoices={items} loadError={null} partialDataWarning="Données partielles." asOfDate="2026-10-10" />);
+    expect(screen.getByRole("status").textContent).toContain("Données partielles");
   });
 });
