@@ -62,7 +62,10 @@ export function DeadlineManager({
   const [filter, setFilter] = useState<DueDateFilter>("all");
   const [search, setSearch] = useState("");
   const items = useMemo(() => buildDueDateItems(invoices, asOfDate), [asOfDate, invoices]);
-  const summary = useMemo(() => buildDueDateSummary(items), [items]);
+  const summary = useMemo(() => buildDueDateSummary(invoices), [invoices]);
+  const forecastTone = Math.abs(summary.forecastBalance) <= 0.01
+    ? ""
+    : summary.forecastBalance > 0 ? "is-positive" : "is-negative";
   const visibleItems = useMemo(() => {
     const normalizedSearch = search.trim().toLocaleLowerCase("fr");
     return filterDueDateItems(items, filter).filter((item) => {
@@ -103,20 +106,23 @@ export function DeadlineManager({
               <strong>{formatMoney(summary.payable)}</strong>
               <small>Factures fournisseurs et dépenses restantes</small>
             </article>
-            <article className={`surface-panel invoice-summary-card deadline-metric ${summary.forecastBalance > 0 ? "is-positive" : summary.forecastBalance < 0 ? "is-negative" : ""}`}>
+            <article className={`surface-panel invoice-summary-card deadline-metric ${forecastTone}`}>
               <span><ArrowLeftRight size={15} /> Solde prévisionnel</span>
               <strong>{formatMoney(summary.forecastBalance)}</strong>
               <small>Écart attendu, pas le solde bancaire réel</small>
             </article>
           </section>
 
-          {summary.nonEuroCount > 0 || summary.incompleteAmountCount > 0 ? (
+          {summary.nonEuroCount > 0 || summary.incompleteAmountCount > 0 || summary.unclassifiedCount > 0 ? (
             <p className="invoice-overview-warning" role="status">
               {summary.nonEuroCount > 0
-                ? `${summary.nonEuroCount} échéance${summary.nonEuroCount === 1 ? "" : "s"} en devise autre que EUR ne sont pas incluses dans les totaux ; aucune conversion n’est disponible. `
+                ? `${summary.nonEuroCount} obligation${summary.nonEuroCount === 1 ? "" : "s"} en devise autre que EUR ne sont pas incluses dans les totaux ; aucune conversion n’est disponible. `
                 : ""}
               {summary.incompleteAmountCount > 0
-                ? `${summary.incompleteAmountCount} échéance${summary.incompleteAmountCount === 1 ? "" : "s"} avec un montant ou une devise inexploitable ne sont pas incluses dans les totaux.`
+                ? `${summary.incompleteAmountCount} obligation${summary.incompleteAmountCount === 1 ? "" : "s"} avec un montant ou une devise inexploitable ne sont pas incluses dans les totaux.`
+                : ""}
+              {summary.unclassifiedCount > 0
+                ? `${summary.unclassifiedCount} facture${summary.unclassifiedCount === 1 ? "" : "s"} sans sens financier confirmé reste${summary.unclassifiedCount === 1 ? "" : "nt"} visible${summary.unclassifiedCount === 1 ? "" : "s"} dans « Toutes » et n’est pas incluse dans les totaux.`
                 : ""}
             </p>
           ) : null}
@@ -159,7 +165,8 @@ export function DeadlineManager({
                     : item.supplierId
                       ? counterpartyNames[item.supplierId] ?? item.clientName ?? "Fournisseur associé"
                       : item.clientName || "Tiers non renseigné";
-                  const counterpartyType = item.direction === "receivable" ? "Client" : "Fournisseur";
+                  const counterpartyType = item.direction === "receivable" ? "Client"
+                    : item.direction === "payable" ? "Fournisseur" : "Tiers";
                   const operationLabel = item.sourceType === "expense"
                     ? `Dépense · ${item.label ?? "Sans libellé"}`
                     : item.invoiceNumber
@@ -176,7 +183,7 @@ export function DeadlineManager({
                     >
                       <div className="deadline-item-main">
                         <div className="deadline-item-title">
-                          <span className="deadline-direction">{counterpartyType} · {item.direction === "payable" ? "À payer" : "À encaisser"}</span>
+                          <span className="deadline-direction">{counterpartyType} · {item.direction === "payable" ? "À payer" : item.direction === "receivable" ? "À encaisser" : "Sens à préciser"}</span>
                           <h3>{counterpartyName}</h3>
                           <p>{operationLabel}</p>
                         </div>
@@ -188,8 +195,8 @@ export function DeadlineManager({
                       <div className="deadline-item-meta">
                         <span><CalendarClock size={15} /> Échéance : {formatDate(item.dueDate ?? "")}</span>
                         <span className={isOverdue ? "deadline-day-count is-overdue" : "deadline-day-count"}>{dueText(item.daysUntilDue)}</span>
-                        <Badge tone={isOverdue ? "danger" : "warning"}>
-                          {isOverdue ? "En retard" : item.direction === "payable" ? "À payer" : "À encaisser"}
+                        <Badge tone={isOverdue ? "danger" : item.direction === "unclassified" ? "neutral" : "warning"}>
+                          {isOverdue ? "En retard" : item.direction === "payable" ? "À payer" : item.direction === "receivable" ? "À encaisser" : "Sens à préciser"}
                         </Badge>
                       </div>
                     </Link>

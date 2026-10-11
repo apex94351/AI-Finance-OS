@@ -4,6 +4,7 @@ import { contactInvoiceSchema, contactRowSchema, mapContact } from "@/services/c
 import type { ContactKind, ContactRecord } from "@/types/invoice";
 import type { ContactCompany, ContactInvoice } from "@/database/components/contacts/contact-workspace";
 import { expenseRowSchema, type ExpenseRecord } from "@/services/expenses";
+import { getEffectiveInvoiceStatus } from "@/services/invoice-validation";
 
 const membershipsSchema = z.array(z.object({ company_id: z.uuid() }));
 const companiesSchema = z.array(z.object({ id: z.uuid(), name: z.string() }));
@@ -11,6 +12,13 @@ const linkedInvoiceSchema = contactInvoiceSchema.extend({
   customer_id: z.uuid().nullable(),
   supplier_id: z.uuid().nullable(),
 });
+const invoicePaymentRowsSchema = z.array(z.object({ invoice_id: z.uuid(), amount: z.union([z.number(), z.string().regex(/^\d+(?:\.\d+)?$/).transform(Number)]) }));
+const linkedExpenseRowsSchema = z.array(z.object({
+  id: z.uuid(),
+  invoice_id: z.uuid(),
+  status: z.enum(["pending", "paid", "overdue", "cancelled"]),
+}));
+const expensePaymentRowsSchema = z.array(z.object({ expense_id: z.uuid(), amount: z.union([z.number(), z.string().regex(/^\d+(?:\.\d+)?$/).transform(Number)]) }));
 
 export interface ContactWorkspaceData {
   contacts: ContactRecord[];
@@ -18,6 +26,7 @@ export interface ContactWorkspaceData {
   invoicesByContact: Record<string, ContactInvoice[]>;
   expensesBySupplier: Record<string, ExpenseRecord[]>;
   expensesWarning: string | null;
+  paymentWarning: string | null;
   loadError: string | null;
 }
 
@@ -27,6 +36,7 @@ const emptyData = (loadError: string): ContactWorkspaceData => ({
   invoicesByContact: {},
   expensesBySupplier: {},
   expensesWarning: null,
+  paymentWarning: null,
   loadError,
 });
 
@@ -140,6 +150,63 @@ export async function loadContactWorkspace(
     return emptyData("Les factures associées reçues ne sont pas au format attendu.");
   }
 
+  const invoiceIds = linkedInvoices.data.map(({ id }) => id);
+  const paidByInvoice = new Map<string, number>();
+  let paymentWarning: string | null = null;
+  let paymentDataAvailable = true;
+  if (invoiceIds.length && kind === "customers") {
+    const paymentsResult = await supabase.from("invoice_payments").select("invoice_id, amount").in("invoice_id", invoiceIds);
+    const payments = invoicePaymentRowsSchema.safeParse(paymentsResult.data ?? []);
+    const paymentTableMissing = Boolean(paymentsResult.error
+      && ["42P01", "42703", "PGRST202", "PGRST204", "PGRST205"].includes(paymentsResult.error.code ?? ""));
+    if (paymentTableMissing) {
+      console.error("Customer invoice payment ledger is not installed", { code: paymentsResult.error?.code });
+      paymentWarning = "Les factures et fiches restent accessibles. L’historique de paiements partiels clients nécessite la migration 017.";
+    } else if (paymentsResult.error || !payments.success) {
+      console.error("Contact customer invoice payment query failed", { code: paymentsResult.error?.code ?? "INVALID_RESULT" });
+      paymentDataAvailable = false;
+      paymentWarning = ["Les fiches et factures restent accessibles.",
+        ["42P01", "PGRST202", "PGRST205"].includes(paymentsResult.error?.code ?? "")
+          ? "Les paiements partiels clients nécessitent la migration 017_invoice_directions_and_customer_payments.sql."
+          : "L’historique des paiements clients ne peut pas être vérifié avec les permissions ou le schéma chargés."]
+      .join(" ");
+    } else {
+      for (const payment of payments.data) {
+        paidByInvoice.set(payment.invoice_id, Math.round(((paidByInvoice.get(payment.invoice_id) ?? 0) + payment.amount) * 100) / 100);
+      }
+    }
+  }
+  if (invoiceIds.length && kind === "suppliers") {
+    const expensesResult = await supabase.from("expenses").select("id, invoice_id, status").in("invoice_id", invoiceIds);
+    const linkedExpenses = linkedExpenseRowsSchema.safeParse(expensesResult.data ?? []);
+    if (expensesResult.error || !linkedExpenses.success) {
+      console.error("Contact supplier invoice expense query failed", { code: expensesResult.error?.code ?? "INVALID_RESULT" });
+      paymentDataAvailable = false;
+      paymentWarning = "Les fiches et factures restent accessibles, mais les paiements fournisseurs liés ne peuvent pas être vérifiés.";
+    } else {
+      const expenseIds = linkedExpenses.data.map(({ id }) => id);
+      const paymentsResult = expenseIds.length
+        ? await supabase.from("expense_payments").select("expense_id, amount").in("expense_id", expenseIds)
+        : { data: [], error: null };
+      const payments = expensePaymentRowsSchema.safeParse(paymentsResult.data ?? []);
+      if (paymentsResult.error || !payments.success) {
+        console.error("Contact supplier payment query failed", { code: paymentsResult.error?.code ?? "INVALID_RESULT" });
+        paymentDataAvailable = false;
+        paymentWarning = "Les fiches et factures restent accessibles, mais l’historique des paiements fournisseurs n’est pas disponible.";
+      } else {
+        const paidByExpense = new Map<string, number>();
+        for (const payment of payments.data) {
+          paidByExpense.set(payment.expense_id, Math.round(((paidByExpense.get(payment.expense_id) ?? 0) + payment.amount) * 100) / 100);
+        }
+        for (const expense of linkedExpenses.data) {
+          const invoiceTotal = linkedInvoices.data.find(({ id }) => id === expense.invoice_id)?.total_ttc ?? 0;
+          const amount = expense.status === "paid" ? invoiceTotal : paidByExpense.get(expense.id) ?? 0;
+          paidByInvoice.set(expense.invoice_id, Math.round(((paidByInvoice.get(expense.invoice_id) ?? 0) + amount) * 100) / 100);
+        }
+      }
+    }
+  }
+
   const invoicesByContact: Record<string, ContactInvoice[]> = {};
   for (const invoice of linkedInvoices.data) {
     const contactId = kind === "customers" ? invoice.customer_id : invoice.supplier_id;
@@ -152,7 +219,9 @@ export async function loadContactWorkspace(
       dueDate: invoice.due_date,
       total: invoice.total_ttc,
       currency: invoice.currency,
-      status: invoice.status,
+      status: getEffectiveInvoiceStatus(invoice.status, invoice.due_date),
+      paidAmount: invoice.status === "paid" ? invoice.total_ttc ?? 0
+        : paymentDataAvailable ? paidByInvoice.get(invoice.id) ?? 0 : null,
     });
   }
 
@@ -220,8 +289,8 @@ export async function loadContactWorkspace(
 
   const selectedContact = contacts.find(({ id }) => id === selectedContactId);
   if (selectedContactId && !selectedContact) {
-    return { contacts, companies: companies.data, invoicesByContact, expensesBySupplier, expensesWarning, loadError: "Cette fiche n’existe pas ou n’est pas accessible avec votre compte." };
+    return { contacts, companies: companies.data, invoicesByContact, expensesBySupplier, expensesWarning, paymentWarning, loadError: "Cette fiche n’existe pas ou n’est pas accessible avec votre compte." };
   }
 
-  return { contacts, companies: companies.data, invoicesByContact, expensesBySupplier, expensesWarning, loadError: null };
+  return { contacts, companies: companies.data, invoicesByContact, expensesBySupplier, expensesWarning, paymentWarning, loadError: null };
 }

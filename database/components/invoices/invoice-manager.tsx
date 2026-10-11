@@ -10,11 +10,12 @@ import { EmptyState } from "@/database/components/ui/empty-state";
 import { deleteInvoice, updateInvoicePaymentStatus, type InvoiceActionState } from "@/app/invoices/actions";
 import { getInvoiceStatusLabel } from "@/services/manual-invoice";
 import { buildInvoiceOverview, type InvoiceCurrencyTotal, type InvoiceOverviewPeriod } from "@/services/invoice-overview";
-import { getEffectiveInvoiceStatus } from "@/services/invoice-validation";
-import type { ContactRecord, InvoiceCompany, InvoicePaymentStatus, InvoiceRecord, InvoiceStatus } from "@/types/invoice";
+import { getEffectiveInvoiceStatus, getInvoiceDirection, getInvoiceDisplayStatus, getInvoiceRemainingAmount } from "@/services/invoice-validation";
+import type { ContactRecord, InvoiceCompany, InvoiceDisplayStatus, InvoicePaymentStatus, InvoiceRecord } from "@/types/invoice";
 import { InvoiceForm } from "./invoice-form";
+import { InvoicePaymentForm } from "./invoice-payment-form";
 
-type StatusFilter = "all" | InvoiceStatus;
+type StatusFilter = "all" | InvoiceDisplayStatus;
 export type InvoiceDashboardFilter =
   | "customer-open"
   | "supplier-open"
@@ -45,16 +46,20 @@ interface InvoiceManagerProps {
   sourceDocumentError?: string | null;
 }
 
-const statusTones: Record<InvoiceStatus, "neutral" | "success" | "warning" | "danger"> = {
+const statusTones: Record<InvoiceDisplayStatus, "neutral" | "success" | "warning" | "danger"> = {
   draft: "neutral",
   pending: "warning",
   paid: "success",
   overdue: "danger",
   receivable: "success",
   cancelled: "neutral",
+  unpaid: "warning",
+  partially_paid: "warning",
+  unclassified: "neutral",
+  payment_inconsistent: "danger",
 };
 
-const filters: StatusFilter[] = ["all", "pending", "overdue", "paid"];
+const filters: StatusFilter[] = ["all", "unpaid", "partially_paid", "pending", "overdue", "paid", "cancelled", "draft", "unclassified", "payment_inconsistent"];
 
 function getCurrency(invoice: InvoiceRecord, companies: InvoiceCompany[]) {
   return invoice.currency ?? companies.find((company) => company.id === invoice.companyId)?.currency ?? "EUR";
@@ -85,20 +90,21 @@ function formatDate(date: string | null) {
 
 function matchesDashboardFilter(invoice: InvoiceRecord, filter: InvoiceDashboardFilter | undefined, asOfDate: string) {
   if (!filter) return true;
-  const customer = Boolean(invoice.customerId) || (!invoice.supplierId && Boolean(invoice.clientName));
+  const direction = getInvoiceDirection(invoice);
   const effectiveStatus = getEffectiveInvoiceStatus(invoice.status, invoice.dueDate, new Date(`${asOfDate}T00:00:00Z`));
   const active = effectiveStatus === "pending" || effectiveStatus === "overdue";
-  const hasBalance = invoice.total !== null && Number.isFinite(invoice.total) && invoice.total > 0;
+  const remaining = getInvoiceRemainingAmount(invoice.total, invoice.paidAmount, invoice.status);
+  const hasBalance = remaining !== null && remaining > 0;
   const validDueDate = Boolean(invoice.dueDate && /^\d{4}-\d{2}-\d{2}$/.test(invoice.dueDate)
     && !Number.isNaN(Date.parse(`${invoice.dueDate}T00:00:00Z`))
     && new Date(`${invoice.dueDate}T00:00:00Z`).toISOString().slice(0, 10) === invoice.dueDate);
   const overdue = active && hasBalance && validDueDate && Boolean(invoice.dueDate && invoice.dueDate < asOfDate);
   switch (filter) {
-    case "customer-open": return customer && active && hasBalance;
-    case "supplier-open": return Boolean(invoice.supplierId) && active && hasBalance;
-    case "customer-invoices": return customer && effectiveStatus !== "draft" && effectiveStatus !== "cancelled";
-    case "customer-overdue": return customer && overdue;
-    case "supplier-upcoming": return Boolean(invoice.supplierId) && active && hasBalance
+    case "customer-open": return direction === "customer" && active && hasBalance;
+    case "supplier-open": return direction === "supplier" && active && hasBalance;
+    case "customer-invoices": return direction === "customer" && effectiveStatus !== "draft" && effectiveStatus !== "cancelled";
+    case "customer-overdue": return direction === "customer" && overdue;
+    case "supplier-upcoming": return direction === "supplier" && active && hasBalance
       && validDueDate && Boolean(invoice.dueDate && invoice.dueDate >= asOfDate
         && invoice.dueDate <= new Date(Date.parse(`${asOfDate}T00:00:00Z`) + 30 * 86_400_000).toISOString().slice(0, 10));
     case "all-overdue": return overdue;
@@ -144,6 +150,7 @@ export function InvoiceManager({
   const [activeSourceDocument, setActiveSourceDocument] = useState<InvoiceSourceDocument | null>(sourceDocument);
   const [showForm, setShowForm] = useState(Boolean(sourceDocument));
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [payingInvoiceId, setPayingInvoiceId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
@@ -171,11 +178,12 @@ export function InvoiceManager({
     const normalizeSearchText = (value: string) => value.trim().replace(/\s+/g, " ").toLocaleLowerCase("fr");
     const normalizedQuery = normalizeSearchText(query);
     return workspaceInvoices.filter((invoice) => {
-      const effectiveStatus = getEffectiveInvoiceStatus(invoice.status, invoice.dueDate, new Date(`${today}T00:00:00Z`));
-      const amountText = invoice.total === null ? "" : [
-        String(invoice.total),
-        invoice.total.toFixed(2),
-        invoice.total.toFixed(2).replace(".", ","),
+      const effectiveStatus = getInvoiceDisplayStatus(invoice, new Date(`${today}T00:00:00Z`));
+      const amount = getInvoiceRemainingAmount(invoice.total, invoice.paidAmount, invoice.status);
+      const amountText = amount === null ? "" : [
+      String(amount),
+      amount.toFixed(2),
+      amount.toFixed(2).replace(".", ","),
       ].join(" ");
       const matchesQuery = !normalizedQuery || [
         invoice.invoiceNumber,
@@ -246,6 +254,11 @@ export function InvoiceManager({
     });
   }
 
+  function handlePaymentSaved() {
+    setPayingInvoiceId(null);
+    router.refresh();
+  }
+
   const canUseInvoices = !loadError;
   const handleFormSaved = useCallback(() => {
     setShowForm(false);
@@ -268,6 +281,7 @@ export function InvoiceManager({
       </div>
 
       {loadError ? <p className="auth-message is-error invoice-message" role="alert">{loadError}</p> : null}
+      {contactWarning && !loadError ? <p className="dashboard-partial-warning" role="status">{contactWarning}</p> : null}
       {deleteError ? <p className="auth-message is-error invoice-message" role="alert">{deleteError}</p> : null}
       {sourceDocumentError ? <p className="auth-message is-error invoice-message" role="alert">{sourceDocumentError}</p> : null}
       {activeSourceDocument ? (
@@ -328,11 +342,11 @@ export function InvoiceManager({
             </article>
           </section>
           <p className="invoice-overview-note">
-            Les indicateurs et récapitulatifs utilisent la période d’émission sélectionnée. Le solde net inclut les factures payées et impayées ; à encaisser, à payer et en retard correspondent aux factures encore impayées de cette période. Aucune conversion de devise n’est effectuée et une facture ouverte est comptée à son montant TTC intégral.
+            Les indicateurs utilisent la période d’émission sélectionnée. À encaisser, à payer et en retard correspondent aux soldes restant dus ; le solde net des factures compare les montants TTC émis sur la période. Aucune conversion de devise n’est effectuée.
           </p>
           {overview.customers.incompleteAmountCount + overview.suppliers.incompleteAmountCount + overview.unclassifiedCount > 0 ? (
             <p className="invoice-overview-warning" role="status">
-              {overview.customers.incompleteAmountCount + overview.suppliers.incompleteAmountCount + overview.unclassifiedCount} facture{overview.customers.incompleteAmountCount + overview.suppliers.incompleteAmountCount + overview.unclassifiedCount === 1 ? "" : "s"} ne sont pas entièrement totalisée{overview.customers.incompleteAmountCount + overview.suppliers.incompleteAmountCount + overview.unclassifiedCount === 1 ? "" : "s"} : montant/devise inexploitable ou type de tiers manquant.
+              {overview.customers.incompleteAmountCount + overview.suppliers.incompleteAmountCount + overview.unclassifiedCount} facture{overview.customers.incompleteAmountCount + overview.suppliers.incompleteAmountCount + overview.unclassifiedCount === 1 ? "" : "s"} ne sont pas entièrement totalisée{overview.customers.incompleteAmountCount + overview.suppliers.incompleteAmountCount + overview.unclassifiedCount === 1 ? "" : "s"} : montant/devise inexploitable ou sens financier non confirmé. Utilisez « Modifier » pour vérifier le type sans changer le montant.
             </p>
           ) : null}
 
@@ -382,7 +396,7 @@ export function InvoiceManager({
               </label>
               <select value={status} onChange={(event) => setStatus(event.target.value as StatusFilter)} aria-label="Filtrer par statut">
                 <option value="all">Tous les statuts</option>
-                {filters.filter((value): value is InvoiceStatus => value !== "all").map((value) => (
+                {filters.filter((value): value is InvoiceDisplayStatus => value !== "all").map((value) => (
                   <option value={value} key={value}>{getInvoiceStatusLabel(value)}</option>
                 ))}
               </select>
@@ -397,7 +411,7 @@ export function InvoiceManager({
               <div className="invoice-table-scroll">
                 <table className="invoice-table">
                   <thead>
-                    <tr><th>Numéro</th><th>Client</th><th>Émise le</th><th>Échéance</th><th>Montant TTC</th><th>Statut</th><th><span className="sr-only">Actions</span></th></tr>
+                    <tr><th>Numéro</th><th>Client / fournisseur</th><th>Émise le</th><th>Échéance</th><th>Montant TTC</th><th>Statut</th><th><span className="sr-only">Actions</span></th></tr>
                   </thead>
                   <tbody>
                     {visibleInvoices.map((invoice) => {
@@ -409,11 +423,14 @@ export function InvoiceManager({
                           id={invoice.id}
                           invoice={invoice}
                           currency={currency}
+                          displayStatus={getInvoiceDisplayStatus(invoice)}
+                          remaining={getInvoiceRemainingAmount(invoice.total, invoice.paidAmount, invoice.status)}
                           companyName={companies.find((company) => company.id === invoice.companyId)?.name ?? "Espace personnel"}
                           expanded={expanded}
                           deleting={isDeleting && deletingId === invoice.id}
                           updating={updatingId === invoice.id}
                           onStatusChange={(targetStatus) => handleStatusChange(invoice, targetStatus)}
+                          onPay={() => setPayingInvoiceId(invoice.id)}
                           onToggle={() => setExpandedId(expanded ? null : invoice.id)}
                           onEdit={() => openEditForm(invoice)}
                           onDelete={() => handleDelete(invoice)}
@@ -436,6 +453,22 @@ export function InvoiceManager({
               />
             )}
           </section>
+          {payingInvoiceId ? (() => {
+            const invoice = workspaceInvoices.find(({ id }) => id === payingInvoiceId);
+            if (!invoice) return null;
+            const remaining = getInvoiceRemainingAmount(invoice.total, invoice.paidAmount, invoice.status);
+            return (
+              <section className="surface-panel invoice-form-panel" aria-labelledby="invoice-payment-heading">
+                <div className="invoice-form-title">
+                  <div><span className="panel-kicker">Paiement partiel ou total</span><h2 id="invoice-payment-heading">Enregistrer un paiement · {invoice.invoiceNumber ?? "Facture sans numéro"}</h2></div>
+                  <button className="text-button" type="button" onClick={() => setPayingInvoiceId(null)}>Fermer</button>
+                </div>
+                {remaining === null ? <p className="auth-message is-error" role="alert">Le montant restant est incohérent ou indisponible.</p> : (
+                  <InvoicePaymentForm companyId={invoice.companyId} invoiceId={invoice.id} balance={remaining} today={today} onSaved={handlePaymentSaved} />
+                )}
+              </section>
+            );
+          })() : null}
         </>
       ) : null}
     </>
@@ -446,6 +479,8 @@ function InvoiceRows({
   id,
   invoice,
   currency,
+  displayStatus,
+  remaining,
   companyName,
   expanded,
   deleting,
@@ -454,10 +489,13 @@ function InvoiceRows({
   onEdit,
   onDelete,
   onStatusChange,
+  onPay,
 }: {
   id: string;
   invoice: InvoiceRecord;
   currency: string;
+  displayStatus: InvoiceDisplayStatus;
+  remaining: number | null;
   companyName: string;
   expanded: boolean;
   deleting: boolean;
@@ -466,13 +504,16 @@ function InvoiceRows({
   onEdit: () => void;
   onDelete: () => void;
   onStatusChange: (status: InvoicePaymentStatus) => void;
+  onPay: () => void;
 }) {
   const [statusMenuOpen, setStatusMenuOpen] = useState(false);
   const [statusMenuPosition, setStatusMenuPosition] = useState<{ top: number; left: number } | null>(null);
   const statusButtonRef = useRef<HTMLButtonElement>(null);
   const statusMenuRef = useRef<HTMLDivElement>(null);
   const effectiveStatus = getEffectiveInvoiceStatus(invoice.status, invoice.dueDate);
-  const canChangePaymentStatus = effectiveStatus === "pending" || effectiveStatus === "overdue" || effectiveStatus === "paid";
+  const direction = getInvoiceDirection(invoice);
+  const canChangePaymentStatus = direction !== null
+    && (effectiveStatus === "pending" || effectiveStatus === "overdue" || effectiveStatus === "paid");
 
   useEffect(() => {
     if (!statusMenuOpen) return;
@@ -518,15 +559,15 @@ function InvoiceRows({
         <td>{invoice.clientName ?? "—"}</td>
         <td>{formatDate(invoice.issueDate)}</td>
         <td>{formatDate(invoice.dueDate)}</td>
-        <td className="invoice-amount-cell">{formatMoney(invoice.total, currency)}</td>
+        <td className="invoice-amount-cell">{formatMoney(invoice.total, currency)}{remaining !== null && remaining > 0 && invoice.paidAmount ? <small className="expense-row-note">Reste {formatMoney(remaining, currency)}</small> : null}</td>
         <td>
           {canChangePaymentStatus ? (
             <div className="invoice-status-control">
-              <button ref={statusButtonRef} className="invoice-status-button" type="button" disabled={updating} aria-expanded={statusMenuOpen} aria-label={`Statut ${getInvoiceStatusLabel(effectiveStatus)} pour ${invoice.invoiceNumber ?? "la facture"}`} onClick={() => {
+              <button ref={statusButtonRef} className="invoice-status-button" type="button" disabled={updating} aria-expanded={statusMenuOpen} aria-label={`Statut ${getInvoiceStatusLabel(displayStatus, direction)} pour ${invoice.invoiceNumber ?? "la facture"}`} onClick={() => {
                 setStatusMenuOpen((open) => !open);
                 setStatusMenuPosition(null);
               }}>
-                <Badge tone={statusTones[effectiveStatus]}>{getInvoiceStatusLabel(effectiveStatus)}</Badge>
+                <Badge tone={statusTones[displayStatus]}>{getInvoiceStatusLabel(displayStatus, direction)}</Badge>
               </button>
               {statusMenuOpen && typeof document !== "undefined" ? createPortal(
                 <div
@@ -538,16 +579,19 @@ function InvoiceRows({
                     visibility: statusMenuPosition ? "visible" : "hidden",
                   }}
                 >
-                  <button type="button" disabled={updating} onClick={() => selectStatus("pending")}>À payer</button>
-                  <button type="button" disabled={updating} onClick={() => selectStatus("paid")}>Payée</button>
-                  <button type="button" disabled={updating} onClick={() => selectStatus("overdue")}>En retard</button>
+                  <button type="button" disabled={updating} onClick={() => selectStatus("pending")}>{direction === "customer" ? "Impayée" : "À payer"}</button>
+                  {direction !== "customer" ? <button type="button" disabled={updating} onClick={() => selectStatus("paid")}>Payée</button> : null}
                 </div>,
                 document.body,
               ) : null}
             </div>
-          ) : <Badge tone={statusTones[effectiveStatus]}>{getInvoiceStatusLabel(effectiveStatus)}</Badge>}
+          ) : <Badge tone={statusTones[displayStatus]}>{getInvoiceStatusLabel(displayStatus, direction)}</Badge>}
         </td>
         <td className="invoice-row-actions">
+          {direction === "customer" && ["pending", "overdue", "receivable"].includes(invoice.status)
+            && remaining !== null && remaining > 0
+            ? <button className="text-button" type="button" onClick={onPay} disabled={updating}>Paiement</button>
+            : null}
           <button className="text-button" type="button" onClick={onEdit}>Modifier</button>
           <button className="invoice-delete-button" type="button" onClick={onDelete} disabled={deleting} aria-label={`Supprimer ${invoice.invoiceNumber ?? "la facture"}`}>
             <Trash2 size={15} />

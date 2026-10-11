@@ -3,11 +3,13 @@ import { getEffectiveInvoiceStatus } from "@/services/invoice-validation";
 import { getEffectiveExpenseStatus, type ExpenseStatus } from "@/services/expenses";
 
 export type DueDateFilter = "all" | "payable" | "receivable";
-export type DueDateDirection = "payable" | "receivable";
+export type DueDateDirection = "payable" | "receivable" | "unclassified";
 
 export interface DueDateRecord {
   id: string;
   sourceType?: "invoice" | "expense";
+  invoiceType?: "customer" | "supplier" | null;
+  sourceDocumentCategory?: "customer_invoice" | "supplier_invoice" | null;
   invoiceId?: string | null;
   companyId: string | null;
   customerId?: string | null;
@@ -19,7 +21,7 @@ export interface DueDateRecord {
   currency: string | null;
   status: InvoiceStatus | ExpenseStatus;
   label?: string | null;
-  paidAmount?: number;
+  paidAmount?: number | null;
   grossTotal?: number | null;
 }
 
@@ -36,6 +38,7 @@ export interface DueDateSummary {
   forecastBalance: number;
   nonEuroCount: number;
   incompleteAmountCount: number;
+  unclassifiedCount: number;
 }
 
 function dateOrdinal(value: string): number | null {
@@ -53,16 +56,24 @@ function dateOrdinal(value: string): number | null {
 function getRemainingAmount(record: DueDateRecord): number | null {
   const grossTotal = record.grossTotal ?? record.total;
   if (grossTotal === null || !Number.isFinite(grossTotal) || grossTotal < 0) return null;
-  if (record.status === "paid") return 0;
   const paidAmount = record.paidAmount ?? 0;
   if (!Number.isFinite(paidAmount) || paidAmount < 0) return null;
-  return Math.max(0, Math.round((grossTotal - paidAmount + Number.EPSILON) * 100) / 100);
+  if (Math.round((paidAmount + Number.EPSILON) * 100) > Math.round((grossTotal + Number.EPSILON) * 100)) return null;
+  if (record.status === "paid") return 0;
+  if (record.paidAmount === null) return null;
+  const remainingCents = Math.round((grossTotal + Number.EPSILON) * 100)
+    - Math.round((paidAmount + Number.EPSILON) * 100);
+  if (remainingCents < 0) return null;
+  return remainingCents / 100;
 }
 
 function getDirection(record: DueDateRecord): DueDateDirection {
-  if (record.sourceType === "expense" || record.supplierId) return "payable";
-  if (record.customerId || record.status === "receivable") return "receivable";
-  return "payable";
+  if (record.sourceType === "expense") return "payable";
+  if (record.invoiceType === "customer" || record.customerId) return "receivable";
+  if (record.invoiceType === "supplier" || record.supplierId) return "payable";
+  if (record.sourceDocumentCategory === "customer_invoice") return "receivable";
+  if (record.sourceDocumentCategory === "supplier_invoice") return "payable";
+  return "unclassified";
 }
 
 export function buildDueDateItems(records: DueDateRecord[], asOfDate: string): DueDateItem[] {
@@ -126,27 +137,37 @@ export function deduplicateDueDateRecords(
   ];
 }
 
-export function buildDueDateSummary(items: readonly DueDateItem[]): DueDateSummary {
+export function buildDueDateSummary(records: readonly DueDateRecord[]): DueDateSummary {
   let receivableCents = 0;
   let payableCents = 0;
   let nonEuroCount = 0;
   let incompleteAmountCount = 0;
+  let unclassifiedCount = 0;
 
-  for (const item of items) {
-    if (item.total === null || !Number.isFinite(item.total) || item.total <= 0) {
+  for (const record of records) {
+    if (record.status === "draft" || record.status === "cancelled" || record.status === "paid") continue;
+    const direction = getDirection(record);
+    if (direction === "unclassified") {
+      unclassifiedCount += 1;
+      continue;
+    }
+
+    const remaining = getRemainingAmount(record);
+    if (remaining === 0) continue;
+    if (remaining === null || !Number.isFinite(remaining) || remaining < 0) {
       incompleteAmountCount += 1;
       continue;
     }
-    if (!item.currency || !/^[A-Z]{3}$/.test(item.currency)) {
+    if (!record.currency || !/^[A-Z]{3}$/.test(record.currency)) {
       incompleteAmountCount += 1;
       continue;
     }
-    if (item.currency !== "EUR") {
+    if (record.currency !== "EUR") {
       nonEuroCount += 1;
       continue;
     }
-    const cents = Math.round((item.total + Number.EPSILON) * 100);
-    if (item.direction === "receivable") receivableCents += cents;
+    const cents = Math.round((remaining + Number.EPSILON) * 100);
+    if (direction === "receivable") receivableCents += cents;
     else payableCents += cents;
   }
 
@@ -156,5 +177,6 @@ export function buildDueDateSummary(items: readonly DueDateItem[]): DueDateSumma
     forecastBalance: (receivableCents - payableCents) / 100,
     nonEuroCount,
     incompleteAmountCount,
+    unclassifiedCount,
   };
 }

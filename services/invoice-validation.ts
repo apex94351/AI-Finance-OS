@@ -1,4 +1,5 @@
 import type { ExtractedField, InvoiceAnalysisResult } from "@/lib/ai/types";
+import type { InvoiceDirection, InvoiceDisplayStatus, InvoiceRecord, InvoiceSourceDocumentCategory, InvoiceStatus } from "@/types/invoice";
 
 export interface InvoiceValidationIssue {
   code: string;
@@ -201,10 +202,87 @@ export function deriveInvoiceStatus(
 }
 
 export function getEffectiveInvoiceStatus(
-  status: import("@/types/invoice").InvoiceStatus,
+  status: InvoiceStatus,
   dueDate: string | null,
   currentDate = new Date(),
-): import("@/types/invoice").InvoiceStatus {
-  if (status === "paid" || status === "overdue" || status === "draft" || status === "cancelled") return status;
+): InvoiceStatus {
+  if (status === "paid" || status === "draft" || status === "cancelled") return status;
   return deriveInvoiceStatus(dueDate, currentDate);
+}
+
+export function getInvoiceDirection(
+  invoice: Pick<InvoiceRecord, "invoiceType" | "customerId" | "supplierId" | "sourceDocumentCategory">,
+): InvoiceDirection | null {
+  const hasCustomer = Boolean(invoice.customerId);
+  const hasSupplier = Boolean(invoice.supplierId);
+  if (hasCustomer && hasSupplier) return null;
+  if (invoice.invoiceType) {
+    if ((invoice.invoiceType === "customer" && hasSupplier)
+      || (invoice.invoiceType === "supplier" && hasCustomer)) return null;
+    return invoice.invoiceType;
+  }
+  if (hasCustomer) return "customer";
+  if (hasSupplier) return "supplier";
+  if (invoice.sourceDocumentCategory === "customer_invoice") return "customer";
+  if (invoice.sourceDocumentCategory === "supplier_invoice") return "supplier";
+  return null;
+}
+
+export function getVerifiedInvoiceSourceDocumentCategory(
+  invoice: Pick<InvoiceRecord, "documentId" | "userId" | "companyId">,
+  document: {
+    id: string;
+    userId: string | null;
+    companyId: string | null;
+    category: string;
+  },
+): InvoiceSourceDocumentCategory | null {
+  if (invoice.documentId !== document.id
+    || invoice.userId !== document.userId
+    || invoice.companyId !== document.companyId) return null;
+  return document.category === "customer_invoice" || document.category === "supplier_invoice"
+    ? document.category
+    : null;
+}
+
+export function getInvoiceRemainingAmount(
+  total: number | null,
+  paidAmount: number | null | undefined,
+  status: InvoiceStatus,
+): number | null {
+  const paid = paidAmount ?? 0;
+  if (!Number.isFinite(paid) || paid < 0) return null;
+  if (total !== null && Number.isFinite(total) && total >= 0
+    && Math.round((paid + Number.EPSILON) * 100) > Math.round((total + Number.EPSILON) * 100)) return null;
+  if (status === "paid") return 0;
+  if (total === null || !Number.isFinite(total) || total < 0 || paidAmount === null) return null;
+  const remainingCents = Math.round((total + Number.EPSILON) * 100)
+    - Math.round((paid + Number.EPSILON) * 100);
+  if (remainingCents < 0) return null;
+  return remainingCents / 100;
+}
+
+export function getInvoiceDisplayStatus(
+  invoice: Pick<InvoiceRecord, "invoiceType" | "sourceDocumentCategory" | "customerId" | "supplierId" | "status" | "dueDate" | "total" | "paidAmount">,
+  currentDate = new Date(),
+): InvoiceDisplayStatus {
+  if (invoice.status === "draft" || invoice.status === "cancelled") return invoice.status;
+  if (invoice.paidAmount === null && invoice.status !== "paid") return "payment_inconsistent";
+  const remaining = getInvoiceRemainingAmount(invoice.total, invoice.paidAmount, invoice.status);
+  if (remaining === null && invoice.total !== null && invoice.paidAmount !== null && invoice.paidAmount !== undefined
+    && Number.isFinite(invoice.total) && Number.isFinite(invoice.paidAmount)
+    && invoice.total >= 0 && invoice.paidAmount > invoice.total) return "payment_inconsistent";
+  if (remaining === 0) return "paid";
+
+  const effectiveStatus = getEffectiveInvoiceStatus(invoice.status, invoice.dueDate, currentDate);
+  if (effectiveStatus === "paid" || effectiveStatus === "draft" || effectiveStatus === "cancelled") {
+    return effectiveStatus;
+  }
+  if (effectiveStatus === "overdue") return "overdue";
+
+  const direction = getInvoiceDirection(invoice);
+  if ((invoice.paidAmount ?? 0) > 0) return "partially_paid";
+  if (direction === "customer") return "unpaid";
+  if (direction === "supplier") return "pending";
+  return "unclassified";
 }

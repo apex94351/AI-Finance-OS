@@ -365,6 +365,59 @@ AI CFO ne dispose pas encore de CRUD métier complet dans ce dépôt. Les
 fournisseurs utilisent leurs tables créées en migration 008. Ne rendez pas les
 nouvelles tables publiques et ajoutez des policies propres à chaque ligne.
 
+## Migration 017 : sens des factures et paiements clients
+
+`017_invoice_directions_and_customer_payments.sql` ajoute `invoices.invoice_type`
+(`customer` ou `supplier`) et une table append-only `invoice_payments` pour les
+encaissements clients. Elle doit être appliquée manuellement après vérification
+des migrations `007`, `008`, `010`, `011`, `013`, `015` et `016` sur la base cible. Elle ne change
+aucun statut existant et ne crée aucun faux paiement.
+
+Le backfill classe les factures à partir de `customer_id` ou `supplier_id`
+explicitement renseigné, ou d’un document source dont la catégorie est
+`customer_invoice`/`supplier_invoice` et dont le propriétaire (`user_id` et
+`company_id`) correspond exactement à celui de la facture. Les anciennes
+factures sans relation fiable gardent `invoice_type = NULL` ; l’application
+les affiche « Type à préciser » et les exclut des totaux à encaisser/à payer
+jusqu’à une classification manuelle. Vérifiez les contradictions entre les
+relations de tiers, les catégories documentaires et les données de la base
+cible avant application ; le préflight doit réussir sans correction
+automatique de données.
+
+Les paiements clients sont insérés uniquement via
+`public.record_invoice_payment`, qui vérifie la date, la précision au centime,
+l’accès utilisateur/entreprise, verrouille la facture et refuse tout paiement
+supérieur au solde. Les utilisateurs authentifiés ont uniquement le droit de
+lecture sur `invoice_payments`; la RLS sépare l’utilisateur personnel des
+membres de l’entreprise. Les paiements fournisseur restent dans
+`expense_payments` via `expenses.invoice_id` (unique) ; la migration ajoute un
+contrôle de cohérence pour interdire le dépassement du total fournisseur lié.
+Les factures fournisseurs sans dépense liée ne disposent toujours pas d’un
+registre de paiements partiels.
+
+Après application, vérifier au minimum :
+
+```sql
+select invoice_type, status, count(*)
+from public.invoices
+group by invoice_type, status
+order by invoice_type, status;
+
+select policyname, cmd, roles, qual
+from pg_catalog.pg_policies
+where schemaname = 'public' and tablename = 'invoice_payments';
+
+select has_table_privilege('authenticated', 'public.invoice_payments', 'INSERT') as direct_insert_allowed;
+```
+
+`direct_insert_allowed` doit être `false`. Testez ensuite les paiements partiels,
+le règlement exact, un dépassement, une date future et l’accès croisé entre deux
+utilisateurs et deux entreprises de préproduction. Confirmez qu’une facture
+cliente sans paiement est « Impayée » avant échéance, devient « En retard »
+après échéance, puis « Partiellement payée » ou « Payée » à partir des paiements
+validés. Cette migration n’a pas été appliquée à une base distante et ne crée
+ni ne modifie de tâche planifiée.
+
 ## Ancienne RPC de création d'entreprise
 
 Avant d'appliquer `002_company_onboarding_rpcs.sql`, confirmez dans le projet

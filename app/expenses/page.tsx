@@ -12,7 +12,7 @@ import {
   type ExpenseRecord,
   type ExpensePaymentRecord,
 } from "@/services/expenses";
-import { getEffectiveInvoiceStatus } from "@/services/invoice-validation";
+import { getEffectiveInvoiceStatus, getVerifiedInvoiceSourceDocumentCategory } from "@/services/invoice-validation";
 
 const membershipSchema = z.array(z.object({ company_id: z.uuid() }));
 const companySchema = z.array(z.object({
@@ -28,7 +28,8 @@ const supplierInvoiceSchema = z.array(z.object({
   id: z.uuid(),
   user_id: z.uuid().nullable(),
   company_id: z.uuid().nullable(),
-  supplier_id: z.uuid(),
+  invoice_type: z.enum(["customer", "supplier"]).nullable().optional(),
+  supplier_id: z.uuid().nullable(),
   document_id: z.uuid().nullable(),
   invoice_number: z.string().nullable(),
   client_name: z.string().nullable(),
@@ -49,7 +50,14 @@ const supplierInvoiceSchema = z.array(z.object({
 const expenseColumns = "id, user_id, company_id, label, amount, currency, expense_date, due_date, subtotal_ht, vat_rate, vat_amount, category, supplier_id, document_id, invoice_id, recurrence_id, recurrence_date, status, notes, created_at, updated_at";
 const supplierColumns = "id, user_id, company_id, name";
 const recurringColumns = "id, user_id, company_id, label, amount, currency, subtotal_ht, vat_rate, vat_amount, supplier_id, document_id, category, frequency, start_date, next_due_date, end_date, status, paused_on, notes, created_at, updated_at";
-const invoiceColumns = "id, user_id, company_id, supplier_id, document_id, invoice_number, client_name, description, issue_date, due_date, subtotal_ht, vat_rate, vat_amount, total_ttc, currency, status, category, created_at, updated_at";
+const invoiceColumns = "id, user_id, company_id, invoice_type, supplier_id, document_id, invoice_number, client_name, description, issue_date, due_date, subtotal_ht, vat_rate, vat_amount, total_ttc, currency, status, category, created_at, updated_at";
+const legacyInvoiceColumns = invoiceColumns.replace("invoice_type, ", "");
+const invoiceSourceDocumentSchema = z.array(z.object({
+  id: z.uuid(),
+  user_id: z.uuid().nullable(),
+  company_id: z.uuid().nullable(),
+  category: z.string(),
+}));
 const documentColumns = "id, user_id, company_id, file_name, deleted_at";
 
 export default async function ExpensesPage() {
@@ -85,8 +93,8 @@ export default async function ExpensesPage() {
     companyExpenses,
     personalSuppliers,
     companySuppliers,
-    personalInvoices,
-    companyInvoices,
+    initialPersonalInvoices,
+    initialCompanyInvoices,
     personalRecurring,
     companyRecurring,
     personalDocuments,
@@ -100,9 +108,9 @@ export default async function ExpensesPage() {
     accessibleCompanyIds.length
       ? supabase.from("suppliers").select(supplierColumns).in("company_id", accessibleCompanyIds).is("user_id", null).order("name")
       : Promise.resolve({ data: [], error: null }),
-    supabase.from("invoices").select(invoiceColumns).eq("user_id", user.id).is("company_id", null).not("supplier_id", "is", null),
+    supabase.from("invoices").select(invoiceColumns).eq("user_id", user.id).is("company_id", null),
     accessibleCompanyIds.length
-      ? supabase.from("invoices").select(invoiceColumns).in("company_id", accessibleCompanyIds).is("user_id", null).not("supplier_id", "is", null)
+      ? supabase.from("invoices").select(invoiceColumns).in("company_id", accessibleCompanyIds).is("user_id", null)
       : Promise.resolve({ data: [], error: null }),
     supabase.from("recurring_expenses").select(recurringColumns).eq("user_id", user.id).is("company_id", null).order("next_due_date"),
     accessibleCompanyIds.length
@@ -113,6 +121,20 @@ export default async function ExpensesPage() {
       ? supabase.from("documents").select(documentColumns).in("company_id", accessibleCompanyIds).is("user_id", null).is("deleted_at", null).order("uploaded_at", { ascending: false })
       : Promise.resolve({ data: [], error: null }),
   ]);
+    let personalInvoices = initialPersonalInvoices;
+    let companyInvoices = initialCompanyInvoices;
+  let invoiceTypeAvailable = true;
+  if (["42703", "PGRST204"].includes(personalInvoices.error?.code ?? "")) {
+    personalInvoices = await supabase.from("invoices").select(legacyInvoiceColumns)
+      .eq("user_id", user.id).is("company_id", null) as typeof personalInvoices;
+    invoiceTypeAvailable = false;
+  }
+  if (["42703", "PGRST204"].includes(companyInvoices.error?.code ?? "")) {
+    companyInvoices = (accessibleCompanyIds.length
+      ? await supabase.from("invoices").select(legacyInvoiceColumns).in("company_id", accessibleCompanyIds).is("user_id", null)
+      : { data: [], error: null }) as typeof companyInvoices;
+    invoiceTypeAvailable = false;
+  }
   const requiredError = personalExpenses.error ?? companyExpenses.error
     ?? personalRecurring.error ?? companyRecurring.error;
   if (requiredError) {
@@ -143,6 +165,42 @@ export default async function ExpensesPage() {
     return renderError("Les données reçues pour les dépenses ne sont pas au format attendu.", companies.data);
   }
 
+  const warningMessages: string[] = [];
+  const linkedDocumentIds = [...new Set(parsedInvoices.data.flatMap(({ document_id }) => document_id ? [document_id] : []))];
+  const supplierInvoiceDocumentIds = new Set<string>();
+  const invoiceDocumentsById = new Map<string, z.infer<typeof invoiceSourceDocumentSchema>[number]>();
+  if (linkedDocumentIds.length) {
+    const sourceDocumentsResult = await supabase.from("documents")
+      .select("id, user_id, company_id, category")
+      .in("id", linkedDocumentIds);
+    const sourceDocuments = invoiceSourceDocumentSchema.safeParse(sourceDocumentsResult.data ?? []);
+    if (sourceDocumentsResult.error || !sourceDocuments.success) {
+      warningMessages.push("Les catégories de documents sources ne sont pas disponibles pour qualifier certaines factures fournisseurs.");
+      console.error("Expense invoice document classification query failed", { code: sourceDocumentsResult.error?.code ?? "INVALID_RESULT" });
+    } else {
+      for (const document of sourceDocuments.data) invoiceDocumentsById.set(document.id, document);
+      for (const invoice of parsedInvoices.data) {
+        if (!invoice.document_id) continue;
+        const document = invoiceDocumentsById.get(invoice.document_id);
+        if (!document) continue;
+        const category = getVerifiedInvoiceSourceDocumentCategory({
+          documentId: invoice.document_id,
+          userId: invoice.user_id,
+          companyId: invoice.company_id,
+        }, {
+          id: document.id,
+          userId: document.user_id,
+          companyId: document.company_id,
+          category: document.category,
+        });
+        if (category === "supplier_invoice") supplierInvoiceDocumentIds.add(invoice.id);
+      }
+    }
+  }
+  if (!invoiceTypeAvailable) {
+    warningMessages.push("La migration 017 n’est pas installée ; les factures fournisseurs liées à un tiers ou à un document catégorisé restent visibles.");
+  }
+
   const [expenseDocuments, invoiceDocuments] = [personalDocuments, companyDocuments];
   const parsedDocuments = z.array(z.object({
     id: z.uuid(),
@@ -151,7 +209,6 @@ export default async function ExpensesPage() {
     file_name: z.string(),
     deleted_at: z.string().nullable(),
   })).safeParse([...(personalDocuments.data ?? []), ...(companyDocuments.data ?? [])]);
-  const warningMessages: string[] = [];
   if (personalSuppliers.error || companySuppliers.error) {
     warningMessages.push("Certains fournisseurs ne peuvent pas être affichés.");
     console.error("Expense supplier query failed", { code: personalSuppliers.error?.code ?? companySuppliers.error?.code });
@@ -205,6 +262,8 @@ export default async function ExpensesPage() {
 
   const linkedInvoiceIds = new Set(parsedExpenses.data.flatMap(({ invoice_id }) => invoice_id ? [invoice_id] : []));
   const unlinkedSupplierInvoices: ExpenseRecord[] = parsedInvoices.data
+    .filter((invoice) => (invoice.invoice_type === "supplier" || invoice.supplier_id !== null)
+      || supplierInvoiceDocumentIds.has(invoice.id))
     .filter((invoice) => invoice.status !== "draft" && !linkedInvoiceIds.has(invoice.id))
     .map((invoice) => {
       const status = invoiceDerivedStatus(invoice);

@@ -13,6 +13,7 @@ function invoice(id: string, companyId: string | null): InvoiceRecord {
     id,
     userId: null,
     companyId,
+    invoiceType: "customer",
     documentId: null,
     invoiceNumber: id,
     clientName: "Client",

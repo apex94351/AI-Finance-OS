@@ -40,6 +40,7 @@ const invoices: InvoiceRecord[] = [{
   id: "123e4567-e89b-42d3-a456-426614174001",
   userId: null,
   companyId: companies[0].id,
+  invoiceType: "customer",
   documentId: null,
   invoiceNumber: "FAC-100",
   clientName: "Client Alpha",
@@ -84,6 +85,7 @@ describe("invoice manager", () => {
     const supplierInvoice: InvoiceRecord = {
       ...invoices[0]!,
       id: "supplier-invoice",
+      invoiceType: "supplier",
       invoiceNumber: "SUP-200",
       supplierId: "supplier-id",
       customerId: null,
@@ -144,6 +146,7 @@ describe("invoice manager", () => {
     const supplierInvoice: InvoiceRecord = {
       ...invoices[0]!,
       id: "supplier-overdue",
+      invoiceType: "supplier",
       invoiceNumber: "SUP-LATE",
       customerId: null,
       supplierId: "supplier-id",
@@ -198,17 +201,18 @@ describe("invoice manager", () => {
     expect(customerOpenCard.textContent).toContain("30,00");
   });
 
-  it("offers the three payment statuses in the invoice form", () => {
+  it("requires an invoice direction and offers unpaid client status without fake settlement", () => {
     render(<InvoiceManager companies={[]} invoices={[]} loadError={null} />);
     fireEvent.click(screen.getAllByRole("button", { name: "Nouvelle facture" })[0]);
 
     const invoiceNumber = screen.getByPlaceholderText("FAC-2026-001");
+    fireEvent.change(screen.getByRole("combobox", { name: "Sens de la facture" }), { target: { value: "customers" } });
     const status = screen.getByRole("combobox", { name: "Statut" });
     expect(invoiceNumber.hasAttribute("required")).toBe(true);
     expect(within(status).queryByRole("option", { name: "Brouillon" })).toBeNull();
-    expect(within(status).getByRole("option", { name: "À payer" })).toBeTruthy();
-    expect(within(status).getByRole("option", { name: "Payée" })).toBeTruthy();
-    expect(within(status).getByRole("option", { name: "En retard" })).toBeTruthy();
+    expect(within(status).getByRole("option", { name: "Impayée" })).toBeTruthy();
+    expect(within(status).queryByRole("option", { name: "Payée" })).toBeNull();
+    expect(within(status).queryByRole("option", { name: "En retard" })).toBeNull();
   });
 
   it("filters on every character without case sensitivity, normalizes spaces, and restores on clear", () => {
@@ -255,26 +259,23 @@ describe("invoice manager", () => {
     vi.useRealTimers();
   });
 
-  it("persists payment status changes from the interactive status badge", async () => {
+  it("keeps supplier status changes on the existing payment-status action", async () => {
     updateInvoicePaymentStatus.mockResolvedValue({ success: "Le statut de la facture a été mis à jour." });
-    render(<InvoiceManager companies={companies} invoices={invoices} loadError={null} />);
+    const supplierInvoice = { ...invoices[0]!, invoiceType: "supplier" as const, supplierId: "supplier-1", customerId: null };
+    render(<InvoiceManager companies={companies} invoices={[supplierInvoice]} loadError={null} />);
     fireEvent.click(screen.getByRole("button", { name: "Statut À payer pour FAC-100" }));
     fireEvent.click(screen.getByRole("button", { name: "Payée" }));
 
-    expect(updateInvoicePaymentStatus).toHaveBeenCalledWith(companies[0]!.id, invoices[0]!.id, "paid");
+    expect(updateInvoicePaymentStatus).toHaveBeenCalledWith(companies[0]!.id, supplierInvoice.id, "paid");
     expect(await screen.findByRole("status")).toBeTruthy();
   });
 
-  it("lets the user manually mark an upcoming invoice as overdue", async () => {
-    updateInvoicePaymentStatus.mockResolvedValue({ success: "Le statut de la facture a été mis à jour." });
+  it("offers payment recording for customer invoices instead of manually forcing paid status", () => {
     render(<InvoiceManager companies={companies} invoices={invoices} loadError={null} />);
-    fireEvent.click(screen.getByRole("button", { name: "Statut À payer pour FAC-100" }));
-
-    const overdueOption = await screen.findByRole("button", { name: "En retard" });
-    expect(overdueOption.closest(".invoice-table-scroll")).toBeNull();
-    fireEvent.click(overdueOption);
-
-    expect(updateInvoicePaymentStatus).toHaveBeenCalledWith(companies[0]!.id, invoices[0]!.id, "overdue");
+    expect(screen.getByRole("button", { name: "Paiement" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Paiement" }));
+    expect(screen.getByRole("heading", { name: /Enregistrer un paiement/ })).toBeTruthy();
+    expect(screen.getByRole("spinbutton", { name: "Montant reçu" })).toBeTruthy();
   });
 
   it("keeps the three status choices visible when the menu opens above the button", async () => {
@@ -287,21 +288,23 @@ describe("invoice manager", () => {
       }
       return { x: 0, y: 0, top: 0, right: 0, bottom: 0, left: 0, width: 0, height: 0, toJSON: () => ({}) };
     });
-    render(<InvoiceManager companies={companies} invoices={invoices} loadError={null} />);
+    const supplierInvoice = { ...invoices[0]!, invoiceType: "supplier" as const, supplierId: "supplier-1", customerId: null };
+    render(<InvoiceManager companies={companies} invoices={[supplierInvoice]} loadError={null} />);
     fireEvent.click(screen.getByRole("button", { name: "Statut À payer pour FAC-100" }));
 
-    const menu = await screen.findByRole("button", { name: "En retard" });
+    const menu = await screen.findByRole("button", { name: "Payée" });
     const menuContainer = menu.parentElement;
     expect(menuContainer?.getAttribute("style")).toContain("top: 595px");
     expect(within(menuContainer as HTMLElement).getAllByRole("button").map((button) => button.textContent))
-      .toEqual(["À payer", "Payée", "En retard"]);
+      .toEqual(["À payer", "Payée"]);
     expect(within(menuContainer as HTMLElement).getByRole("button", { name: "À payer" })).toBeTruthy();
     expect(within(menuContainer as HTMLElement).getByRole("button", { name: "Payée" })).toBeTruthy();
   });
 
   it("shows a clear error instead of success when the status update fails", async () => {
     updateInvoicePaymentStatus.mockResolvedValue({ error: "La mise à jour du statut a échoué." });
-    render(<InvoiceManager companies={companies} invoices={invoices} loadError={null} />);
+    const supplierInvoice = { ...invoices[0]!, invoiceType: "supplier" as const, supplierId: "supplier-1", customerId: null };
+    render(<InvoiceManager companies={companies} invoices={[supplierInvoice]} loadError={null} />);
     fireEvent.click(screen.getByRole("button", { name: "Statut À payer pour FAC-100" }));
     fireEvent.click(screen.getByRole("button", { name: "Payée" }));
 

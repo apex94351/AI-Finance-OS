@@ -7,6 +7,7 @@ import { Badge } from "@/database/components/ui/badge";
 import { EmptyState } from "@/database/components/ui/empty-state";
 import { buildDashboardSummary, type DashboardAction } from "@/services/dashboard";
 import { getInvoiceStatusLabel } from "@/services/manual-invoice";
+import { getInvoiceDirection } from "@/services/invoice-validation";
 import type { InvoiceCompany, InvoiceRecord } from "@/types/invoice";
 
 function alertTitle(alert: DashboardAction) {
@@ -136,7 +137,7 @@ export function AlertsManager({
                     </div>
                     <div className="operational-alert-trailing">
                       <strong>{formatAmount(alert.invoice)}</strong>
-                      <small>Statut : {getInvoiceStatusLabel(alert.invoice.status)}</small>
+                      <small>Statut : {getInvoiceStatusLabel(alert.invoice.status, getInvoiceDirection(alert.invoice))}</small>
                       <Link href={`/invoices#invoice-${alert.invoice.id}`} className="text-button">Ouvrir la facture</Link>
                     </div>
                   </article>

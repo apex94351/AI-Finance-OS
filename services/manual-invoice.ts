@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { InvoiceStatus } from "@/types/invoice";
+import type { InvoiceDisplayStatus, InvoiceDirection, InvoiceStatus } from "@/types/invoice";
 
 const amountPattern = /^\d{1,12}(?:[.,]\d{1,2})?$/;
 const ratePattern = /^(?:\d{1,3})(?:[.,]\d{1,2})?$/;
@@ -7,6 +7,7 @@ const ratePattern = /^(?:\d{1,3})(?:[.,]\d{1,2})?$/;
 export const manualInvoiceSchema = z.object({
   invoiceNumber: z.string().trim().max(80).transform((value) => value || null),
   clientName: z.string().trim().min(1, "Saisissez le nom du client.").max(200),
+  invoiceType: z.enum(["customer", "supplier"]),
   description: z.string().trim().min(1, "Saisissez une description.").max(2000),
   subtotal: z.string().trim().regex(amountPattern, "Saisissez un montant HT valide."),
   vatRate: z.string().trim().regex(ratePattern, "Saisissez un taux de TVA entre 0 et 100."),
@@ -74,7 +75,7 @@ export function getPersistedInvoiceStatus(
   const today = currentDate.toISOString().slice(0, 10);
   if (status === "paid") return "paid";
   if (status === "draft" || status === "cancelled") return null;
-  if (status === "overdue") return "overdue";
+  if (status === "overdue") return dueDate && dueDate < today ? "overdue" : null;
   return dueDate && dueDate < today ? "overdue" : "pending";
 }
 
@@ -82,10 +83,14 @@ export function formatInvoiceAmount(value: number | null): string {
   return value === null ? "0.00" : value.toFixed(2);
 }
 
-export function getInvoiceStatusLabel(status: InvoiceStatus): string {
+export function getInvoiceStatusLabel(status: InvoiceDisplayStatus, direction?: InvoiceDirection | null): string {
   switch (status) {
     case "draft": return "Brouillon";
-    case "pending": return "À payer";
+    case "pending": return direction === "customer" ? "Impayée" : "À payer";
+    case "unpaid": return "Impayée";
+    case "partially_paid": return "Partiellement payée";
+    case "unclassified": return "Type à préciser";
+    case "payment_inconsistent": return "Paiement à vérifier";
     case "paid": return "Payée";
     case "overdue": return "En retard";
     case "receivable": return "À recevoir";

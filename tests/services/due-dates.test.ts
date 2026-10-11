@@ -32,6 +32,7 @@ const records: DueDateRecord[] = [
   {
     id: "receivable",
     companyId: null,
+    invoiceType: "customer",
     invoiceNumber: "CLI-003",
     clientName: "Client à encaisser",
     dueDate: "2026-10-10",
@@ -83,8 +84,74 @@ describe("due date calculations", () => {
     expect(items.map(({ id }) => id)).not.toContain("cancelled");
   });
 
+  it("uses explicit invoice direction instead of status or a free-text counterparty", () => {
+    const invoices: DueDateRecord[] = [
+      {
+        id: "customer-without-contact",
+        sourceType: "invoice",
+        invoiceType: "customer",
+        companyId: null,
+        invoiceNumber: "CLI-004",
+        clientName: "Client saisi manuellement",
+        dueDate: "2026-10-15",
+        total: 100,
+        currency: "EUR",
+        status: "pending",
+      },
+      {
+        id: "unknown-receivable-status",
+        sourceType: "invoice",
+        invoiceType: null,
+        companyId: null,
+        invoiceNumber: "LEG-005",
+        clientName: "Tiers non qualifié",
+        dueDate: "2026-10-15",
+        total: 50,
+        currency: "EUR",
+        status: "receivable",
+      },
+    ];
+
+    const items = buildDueDateItems(invoices, "2026-10-10");
+
+    expect(items.find(({ id }) => id === "customer-without-contact")?.direction).toBe("receivable");
+    expect(items.find(({ id }) => id === "unknown-receivable-status")?.direction).toBe("unclassified");
+    expect(filterDueDateItems(items, "receivable").map(({ id }) => id)).toEqual(["customer-without-contact"]);
+    expect(buildDueDateSummary(invoices)).toMatchObject({ receivable: 100, payable: 0, unclassifiedCount: 1 });
+  });
+
+  it("uses the unpaid remainder of customer and supplier invoices", () => {
+    const obligations: DueDateRecord[] = [
+      {
+        ...records[0]!,
+        id: "partially-paid-supplier",
+        invoiceType: "supplier",
+        supplierId: null,
+        total: 75,
+        grossTotal: 100,
+        paidAmount: 25,
+      },
+      {
+        ...records[2]!,
+        id: "partially-paid-customer",
+        invoiceType: "customer",
+        total: 60,
+        grossTotal: 100,
+        paidAmount: 40,
+      },
+    ];
+
+    const items = buildDueDateItems(obligations, "2026-10-10");
+
+    expect(items.find(({ id }) => id === "partially-paid-supplier"))
+      .toMatchObject({ direction: "payable", total: 75 });
+    expect(items.find(({ id }) => id === "partially-paid-customer"))
+      .toMatchObject({ direction: "receivable", total: 60 });
+    expect(buildDueDateSummary(obligations)).toMatchObject({ payable: 75, receivable: 60, forecastBalance: -15 });
+  });
+
   it("calculates euro totals by direction and the forecast balance", () => {
-    const summary = buildDueDateSummary(buildDueDateItems(records, "2026-10-10"));
+    const summary = buildDueDateSummary(records);
 
     expect(summary).toEqual({
       receivable: 330,
@@ -92,6 +159,34 @@ describe("due date calculations", () => {
       forecastBalance: 210,
       nonEuroCount: 0,
       incompleteAmountCount: 0,
+      unclassifiedCount: 0,
+    });
+  });
+
+  it("includes outstanding obligations without a due date in totals, but not in the list", () => {
+    const obligations: DueDateRecord[] = [
+      {
+        id: "undated-expense",
+        sourceType: "expense",
+        companyId: null,
+        supplierId: "supplier-1",
+        invoiceNumber: null,
+        clientName: "Abonnement",
+        label: "Abonnement",
+        dueDate: null,
+        total: 75,
+        grossTotal: 100,
+        paidAmount: 25,
+        currency: "EUR",
+        status: "pending",
+      },
+    ];
+
+    expect(buildDueDateItems(obligations, "2026-10-10")).toEqual([]);
+    expect(buildDueDateSummary(obligations)).toMatchObject({
+      receivable: 0,
+      payable: 75,
+      forecastBalance: -75,
     });
   });
 
@@ -155,7 +250,7 @@ describe("due date calculations", () => {
 
     expect(items.map(({ id, displayedStatus }) => [id, displayedStatus])).toEqual([
       ["past-due", "overdue"],
-      ["manual-overdue", "overdue"],
+      ["manual-overdue", "pending"],
     ]);
   });
 

@@ -7,6 +7,7 @@ function invoice(id: string, overrides: Partial<InvoiceRecord> = {}): InvoiceRec
     id,
     userId: null,
     companyId: null,
+    invoiceType: "customer",
     documentId: null,
     invoiceNumber: `FAC-${id}`,
     clientName: "Client",
@@ -30,8 +31,8 @@ function invoice(id: string, overrides: Partial<InvoiceRecord> = {}): InvoiceRec
 describe("dashboard summary", () => {
   it("groups payable, receivable and overdue totals by currency", () => {
     const summary = buildDashboardSummary([
-      invoice("pay-eur", { supplierId: "supplier", total: 100, currency: "EUR" }),
-      invoice("pay-usd", { supplierId: "supplier", total: 30, currency: "USD" }),
+      invoice("pay-eur", { invoiceType: "supplier", supplierId: "supplier", total: 100, currency: "EUR" }),
+      invoice("pay-usd", { invoiceType: "supplier", supplierId: "supplier", total: 30, currency: "USD" }),
       invoice("receive-eur", { customerId: "customer", status: "receivable", total: 40 }),
       invoice("late-unknown", { status: "overdue", dueDate: "2026-10-09", total: 5, currency: "GBP" }),
       invoice("paid", { status: "paid", total: 900 }),
@@ -78,8 +79,8 @@ describe("dashboard summary", () => {
 
   it("handles missing dates and currency without producing false sums", () => {
     const summary = buildDashboardSummary([
-      invoice("missing-date", { supplierId: "supplier", dueDate: null, total: null, currency: null }),
-      invoice("bad-date", { supplierId: "supplier", dueDate: "2026-02-30", total: 10, currency: "EUR" }),
+      invoice("missing-date", { invoiceType: "supplier", supplierId: "supplier", dueDate: null, total: null, currency: null }),
+      invoice("bad-date", { invoiceType: "supplier", supplierId: "supplier", dueDate: "2026-02-30", total: 10, currency: "EUR" }),
     ], "2026-10-10");
 
     expect(summary.actions.map(({ kind }) => kind)).toEqual(["verify", "verify"]);

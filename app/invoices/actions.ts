@@ -48,6 +48,7 @@ function getInvoiceValues(formData: FormData) {
   const parsed = manualInvoiceSchema.safeParse({
     invoiceNumber: getOptionalFormValue(formData, "invoiceNumber"),
     clientName: getOptionalFormValue(formData, "clientName"),
+    invoiceType: getOptionalFormValue(formData, "invoiceType"),
     description: getOptionalFormValue(formData, "description"),
     subtotal: getOptionalFormValue(formData, "subtotal"),
     vatRate: getOptionalFormValue(formData, "vatRate"),
@@ -125,6 +126,10 @@ export async function saveInvoice(
 
   const customerId = getOptionalFormValue(formData, "customerId");
   const supplierId = getOptionalFormValue(formData, "supplierId");
+  if ((values.invoice.invoiceType === "customer" && supplierId)
+    || (values.invoice.invoiceType === "supplier" && customerId)) {
+    return { error: "Le type de facture doit correspondre au tiers associé." };
+  }
   const counterparty = await getCounterparty(access, ownerCompanyId, customerId, supplierId);
   if ("error" in counterparty) return counterparty;
 
@@ -189,6 +194,7 @@ export async function saveInvoice(
   const invoiceData = {
     company_id: ownerCompanyId,
     user_id: ownerCompanyId ? null : access.user.id,
+    invoice_type: values.invoice.invoiceType,
     invoice_number: values.invoice.invoiceNumber,
     client_name: counterparty.counterparty?.name ?? values.invoice.clientName,
     description: values.invoice.description,
@@ -210,18 +216,27 @@ export async function saveInvoice(
     Object.assign(invoiceData, { customer_id: null, supplier_id: null });
   }
 
-  let result;
-  if (parsedInvoiceId) {
-    const invoiceUpdate = access.supabase.from("invoices").update(invoiceData).eq("id", parsedInvoiceId.data);
-    result = ownerCompanyId
-      ? await invoiceUpdate.eq("company_id", ownerCompanyId).is("user_id", null).select("id").maybeSingle()
-      : await invoiceUpdate.eq("user_id", access.user.id).is("company_id", null).select("id").maybeSingle();
-  } else {
-    result = await access.supabase
-      .from("invoices")
-      .insert({ ...invoiceData, document_id: sourceDocument?.id ?? null, document_type: "invoice" })
+  const persistInvoice = async (payload: Record<string, unknown>) => {
+    if (parsedInvoiceId) {
+      const invoiceUpdate = access.supabase.from("invoices").update(payload).eq("id", parsedInvoiceId.data);
+      return ownerCompanyId
+        ? await invoiceUpdate.eq("company_id", ownerCompanyId).is("user_id", null).select("id").maybeSingle()
+        : await invoiceUpdate.eq("user_id", access.user.id).is("company_id", null).select("id").maybeSingle();
+    }
+    return access.supabase.from("invoices")
+      .insert({ ...payload, document_id: sourceDocument?.id ?? null, document_type: "invoice" })
       .select("id")
       .maybeSingle();
+  };
+  let result = await persistInvoice(invoiceData);
+  const missingInvoiceTypeColumn = ["42703", "PGRST204"].includes(result.error?.code ?? "")
+    && `${result.error?.message ?? ""} ${result.error?.details ?? ""}`.toLowerCase().includes("invoice_type");
+  if (missingInvoiceTypeColumn) {
+    if (!counterparty.counterparty && !sourceDocument) {
+      return { error: "Le schéma distant ne peut pas enregistrer le sens de cette facture libre. Appliquez la migration 017 ou associez explicitement un client/fournisseur appartenant au même espace." };
+    }
+    const legacyPayload = Object.fromEntries(Object.entries(invoiceData).filter(([column]) => column !== "invoice_type"));
+    result = await persistInvoice(legacyPayload);
   }
   const { data, error } = result;
 
@@ -233,14 +248,19 @@ export async function saveInvoice(
     if (error.code === "23503") {
       return { error: "Le document source ou le tiers associé n’existe plus ou n’appartient pas à cette entreprise." };
     }
+    if (error.code === "23514") {
+      return { error: "Le type de facture ou son montant est incompatible avec les paiements ou relations déjà enregistrés." };
+    }
     if (error.code === "42703" || error.code === "PGRST204" || error.code === "23502" || error.code === "22P02") {
-      return { error: "Le schéma Supabase des factures ou des documents n’est pas à jour. Vérifiez les migrations 004 à 008 puis 010 à 012 selon les champs manquants." };
+      return { error: "Le schéma Supabase des factures ou des documents n’est pas à jour. Vérifiez les migrations 004 à 008, 010 à 012 et 017 selon les champs manquants." };
     }
     return { error: "L’enregistrement de la facture a échoué. Vérifiez vos droits et réessayez." };
   }
   if (!data) return { error: "La facture n’a pas été trouvée dans cette entreprise." };
 
   revalidatePath("/invoices");
+  revalidatePath("/due-dates");
+  revalidatePath("/dashboard");
   if (sourceDocument) revalidatePath("/documents");
   return { success: "La facture a été enregistrée." };
 }
@@ -266,6 +286,8 @@ export async function deleteInvoice(companyId: string | null, invoiceId: string)
   if (!data) return { error: "La facture n’a pas été trouvée dans cette entreprise." };
 
   revalidatePath("/invoices");
+  revalidatePath("/due-dates");
+  revalidatePath("/dashboard");
   return { success: "La facture a été supprimée." };
 }
 
@@ -327,6 +349,54 @@ export async function updateInvoicePaymentStatus(
   revalidatePath("/due-dates");
   revalidatePath("/dashboard");
   return { success: "Le statut de la facture a été mis à jour." };
+}
+
+export async function recordInvoicePayment(
+  companyId: string | null,
+  invoiceId: string,
+  paymentDate: string,
+  amount: string,
+  reference: string,
+  note: string,
+): Promise<InvoiceActionState> {
+  if ((companyId && !uuidSchema.safeParse(companyId).success) || !uuidSchema.safeParse(invoiceId).success) {
+    return { error: "La facture sélectionnée n’est pas valide." };
+  }
+  const parsedDate = z.iso.date().safeParse(paymentDate);
+  const parsedAmount = z.string().trim().regex(/^\d{1,12}(?:[.,]\d{1,2})?$/).safeParse(amount);
+  const parsedReference = z.string().trim().max(160).safeParse(reference);
+  const parsedNote = z.string().trim().max(2000).safeParse(note);
+  if (!parsedDate.success || !parsedAmount.success || Number(parsedAmount.data.replace(",", ".")) <= 0
+    || !parsedReference.success || !parsedNote.success) {
+    return { error: "Saisissez une date, un montant et une référence valides." };
+  }
+
+  const access = await getInvoiceAccess(companyId, "/invoices");
+  if ("error" in access) return access;
+  const { error } = await access.supabase.rpc("record_invoice_payment", {
+    target_invoice_id: invoiceId,
+    target_payment_date: parsedDate.data,
+    target_amount: Number(parsedAmount.data.replace(",", ".")),
+    target_reference: parsedReference.data || null,
+    target_note: parsedNote.data || null,
+  });
+  if (error) {
+    console.error("Invoice payment recording failed", { code: error.code });
+    if (error.code === "P0002") return { error: "La facture client est réglée, annulée, en brouillon ou inaccessible." };
+    if (error.code === "22003") return { error: "Le paiement dépasse le solde restant de la facture." };
+    if (error.code === "22007") return { error: "La date de paiement ne peut pas être future." };
+    if (error.code === "22023") return { error: "Le montant ou les informations du paiement sont invalides." };
+    if (["42883", "PGRST202"].includes(error.code ?? "")) {
+      return { error: "Les paiements clients ne sont pas activés. Appliquez manuellement la migration 017_invoice_directions_and_customer_payments.sql." };
+    }
+    if (error.code === "42501") return { error: "Vous ne disposez pas des droits nécessaires pour enregistrer ce paiement." };
+    return { error: "Le paiement n’a pas pu être enregistré. Vérifiez vos droits et réessayez." };
+  }
+
+  revalidatePath("/invoices");
+  revalidatePath("/due-dates");
+  revalidatePath("/dashboard");
+  return { success: "Le paiement client a été enregistré." };
 }
 
 export async function markInvoiceSettled(companyId: string | null, invoiceId: string): Promise<InvoiceActionState> {

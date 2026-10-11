@@ -67,10 +67,25 @@ describe("contact workspace", () => {
     expect(screen.getAllByText("Client Exemple").length).toBeGreaterThan(0);
     expect(screen.getByText("Compte fidèle")).toBeTruthy();
     expect(screen.getAllByText(/125,00/)).toHaveLength(2);
+    expect(screen.getByText("Impayée")).toBeTruthy();
     expect(screen.getByRole("link", { name: /FAC-CLIENT-1/ }).getAttribute("href"))
       .toBe("/invoices#invoice-123e4567-e89b-42d3-a456-426614174012");
     expect(screen.getByRole("link", { name: "Créer une facture liée" }).getAttribute("href"))
       .toBe(`/invoices?partyType=customer&partyId=${contact.id}`);
+  });
+
+  it("shows the remaining amount and partial-payment status for a client invoice", () => {
+    render(<ContactWorkspace {...props} invoicesByContact={{
+      [contact.id]: [{
+        ...props.invoicesByContact[contact.id]![0]!,
+        status: "pending",
+        paidAmount: 25,
+      }],
+    }} />);
+
+    expect(screen.getByText("Partiellement payée")).toBeTruthy();
+    expect(screen.getByText(/Reste 100,00/)).toBeTruthy();
+    expect(document.querySelector(".contact-invoice-summary")?.textContent).toContain("100,00");
   });
 
   it("filters the contact list using the search field", () => {

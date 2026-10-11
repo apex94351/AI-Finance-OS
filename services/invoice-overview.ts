@@ -1,5 +1,5 @@
 import type { InvoiceRecord } from "@/types/invoice";
-import { getEffectiveInvoiceStatus } from "@/services/invoice-validation";
+import { getEffectiveInvoiceStatus, getInvoiceDirection, getInvoiceRemainingAmount } from "@/services/invoice-validation";
 
 export type InvoiceOverviewPeriod = "month" | "year" | "all";
 
@@ -26,8 +26,6 @@ export interface InvoiceOverview {
   net: InvoiceCurrencyTotal[];
   unclassifiedCount: number;
 }
-
-const openStatuses = new Set(["pending", "overdue", "receivable"]);
 
 function validDate(value: string | null): value is string {
   if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
@@ -89,11 +87,8 @@ export function buildInvoiceOverview(
     const status = getEffectiveInvoiceStatus(invoice.status, invoice.dueDate, new Date(`${asOfDate}T00:00:00Z`));
     if (status === "draft" || status === "cancelled") continue;
 
-    const partyTotals = invoice.supplierId
-      ? suppliers
-      : invoice.customerId || invoice.clientName
-        ? customers
-        : null;
+    const direction = getInvoiceDirection(invoice);
+    const partyTotals = direction === "supplier" ? suppliers : direction === "customer" ? customers : null;
     if (!partyTotals) {
       unclassifiedCount += 1;
       continue;
@@ -107,17 +102,29 @@ export function buildInvoiceOverview(
     if (amount === null || currency === null) partyTotals.incompleteAmountCount += 1;
     if (amount !== null && currency !== null) addAmount(partyTotals.issued, amount, currency);
 
-    if (status === "paid") {
-      if (amount !== null && currency !== null) addAmount(partyTotals.paid, amount, currency);
+    const remaining = invoice.remainingAmount
+      ?? getInvoiceRemainingAmount(invoice.total, invoice.paidAmount, invoice.status);
+    if (remaining === null) {
+      if (amount !== null && currency !== null) partyTotals.incompleteAmountCount += 1;
+      partyTotals.outstandingCount += 1;
+      if (isAsOfDateValid && validDate(invoice.dueDate) && invoice.dueDate < asOfDate) {
+        partyTotals.overdueCount += 1;
+      }
       continue;
     }
-    if (!openStatuses.has(status)) continue;
-
-    const hasOutstandingBalance = amount === null || amount > 0;
+    const paidAmount = invoice.paidAmount ?? (status === "paid" ? amount : 0);
+    if (paidAmount !== null && paidAmount > 0 && currency !== null) {
+      addAmount(partyTotals.paid, paidAmount, currency);
+    }
+    if (status === "paid") {
+      if (amount !== null && currency !== null && paidAmount === 0) addAmount(partyTotals.paid, amount, currency);
+      continue;
+    }
+    const hasOutstandingBalance = remaining === null || remaining > 0;
     if (!hasOutstandingBalance) continue;
     partyTotals.outstandingCount += 1;
-    if (amount !== null && amount > 0 && currency !== null) {
-      addAmount(partyTotals.outstanding, amount, currency);
+    if (remaining !== null && remaining > 0 && currency !== null) {
+      addAmount(partyTotals.outstanding, remaining, currency);
     }
 
     const isOverdue = isAsOfDateValid
@@ -126,8 +133,8 @@ export function buildInvoiceOverview(
       && hasOutstandingBalance;
     if (isOverdue) {
       partyTotals.overdueCount += 1;
-      if (amount !== null && amount > 0 && currency !== null) {
-        addAmount(partyTotals.overdue, amount, currency);
+      if (remaining !== null && remaining > 0 && currency !== null) {
+        addAmount(partyTotals.overdue, remaining, currency);
       }
     }
   }

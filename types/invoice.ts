@@ -2,13 +2,20 @@ import type { InvoiceAnalysisResult } from "@/lib/ai/types";
 
 export type InvoiceStatus = "draft" | "pending" | "paid" | "overdue" | "receivable" | "cancelled";
 export type InvoicePaymentStatus = Extract<InvoiceStatus, "pending" | "paid" | "overdue">;
+export type InvoiceDirection = "customer" | "supplier";
+export type InvoiceSourceDocumentCategory = "customer_invoice" | "supplier_invoice";
+export type InvoiceDisplayStatus = InvoiceStatus | "unpaid" | "partially_paid" | "unclassified" | "payment_inconsistent";
 
 export interface InvoiceRecord {
   id: string;
   userId: string | null;
   companyId: string | null;
+  invoiceType?: InvoiceDirection | null;
+  sourceDocumentCategory?: InvoiceSourceDocumentCategory | null;
   customerId?: string | null;
   supplierId?: string | null;
+  paidAmount?: number | null;
+  remainingAmount?: number | null;
   partyLinksAvailable?: boolean;
   documentId: string | null;
   invoiceNumber: string | null;

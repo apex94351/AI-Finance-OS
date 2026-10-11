@@ -8,6 +8,7 @@ export default function DueDatesLoading() {
         <div className="deadline-loading-summary">
           <div className="invoice-loading-card" />
           <div className="invoice-loading-card" />
+          <div className="invoice-loading-card" />
         </div>
         <div className="invoice-loading-list deadline-loading-list">
           <span /><span /><span /><span />

@@ -8,9 +8,10 @@ import { createContact, deleteContact, updateContact } from "@/app/contacts/acti
 import { Badge } from "@/database/components/ui/badge";
 import { EmptyState } from "@/database/components/ui/empty-state";
 import { getInvoiceStatusLabel } from "@/services/manual-invoice";
+import { getInvoiceDisplayStatus, getInvoiceRemainingAmount } from "@/services/invoice-validation";
 import { filterContacts, type ContactSort } from "@/services/contacts";
 import type { ExpenseRecord } from "@/services/expenses";
-import type { ContactKind, ContactRecord } from "@/types/invoice";
+import type { ContactKind, ContactRecord, InvoiceDisplayStatus } from "@/types/invoice";
 
 export interface ContactCompany {
   id: string;
@@ -26,6 +27,7 @@ export interface ContactInvoice {
   total: number | null;
   currency: string | null;
   status: "draft" | "pending" | "paid" | "overdue" | "receivable" | "cancelled";
+  paidAmount?: number | null;
 }
 
 interface ContactWorkspaceProps {
@@ -35,6 +37,7 @@ interface ContactWorkspaceProps {
   invoicesByContact: Record<string, ContactInvoice[]>;
   expensesBySupplier?: Record<string, ExpenseRecord[]>;
   expensesWarning?: string | null;
+  paymentWarning?: string | null;
   selectedContactId: string | null;
   loadError: string | null;
   routeBase?: string;
@@ -49,16 +52,18 @@ function formatMoney(value: number, currency: string) {
   return new Intl.NumberFormat("fr-FR", { style: "currency", currency }).format(value);
 }
 
-function invoiceStatusLabel(status: ContactInvoice["status"]) {
-  return getInvoiceStatusLabel(status);
+function invoiceStatusLabel(status: InvoiceDisplayStatus, direction: "customer" | "supplier") {
+  return getInvoiceStatusLabel(status, direction);
 }
 
 function contactInvoicesSummary(kind: ContactKind, invoices: ContactInvoice[]) {
   const totals = new Map<string, number>();
-  const includedStatuses = kind === "customers" ? ["receivable"] : ["pending"];
+  const includedStatuses = ["pending", "overdue", "receivable"];
   for (const invoice of invoices) {
-    if (!includedStatuses.includes(invoice.status) || invoice.total === null || !invoice.currency) continue;
-    const cents = Math.round(invoice.total * 100);
+    if (!includedStatuses.includes(invoice.status) || !invoice.currency) continue;
+    const remaining = getInvoiceRemainingAmount(invoice.total, invoice.paidAmount, invoice.status);
+    if (remaining === null || remaining <= 0) continue;
+    const cents = Math.round(remaining * 100);
     totals.set(invoice.currency, (totals.get(invoice.currency) ?? 0) + cents);
   }
   return [...totals].map(([currency, amount]) => formatMoney(amount / 100, currency)).join(" · ") || "—";
@@ -71,6 +76,7 @@ export function ContactWorkspace({
   invoicesByContact,
   expensesBySupplier = {},
   expensesWarning = null,
+  paymentWarning = null,
   selectedContactId,
   loadError,
   routeBase = `/${kind}`,
@@ -152,6 +158,7 @@ export function ContactWorkspace({
       </div>
 
       {loadError ? <p className="auth-message is-error invoice-message" role="alert">{loadError}</p> : null}
+      {paymentWarning ? <p className="invoice-overview-warning" role="status">{paymentWarning}</p> : null}
       {error ? <p className="auth-message is-error invoice-message" role="alert">{error}</p> : null}
 
       {showForm ? (
@@ -249,12 +256,28 @@ export function ContactWorkspace({
                 <div className="contact-invoices-heading"><h3>Factures associées</h3><span>{selectedInvoices.length}</span></div>
                 {selectedInvoices.length ? (
                   <div className="contact-invoices">
-                    {selectedInvoices.map((invoice) => (
-                      <Link className="contact-invoice-row" href={`/invoices#invoice-${invoice.id}`} key={invoice.id}>
-                        <span><strong>{invoice.invoiceNumber || "Brouillon sans numéro"}</strong><small>{invoice.issueDate || "Date inconnue"} · Échéance {invoice.dueDate || "non renseignée"}</small></span>
-                        <span>{invoice.total === null || !invoice.currency ? "Montant à vérifier" : formatMoney(invoice.total, invoice.currency)}<Badge tone={invoice.status === "overdue" ? "danger" : invoice.status === "paid" ? "success" : "warning"}>{invoiceStatusLabel(invoice.status)}</Badge></span>
-                      </Link>
-                    ))}
+                    {selectedInvoices.map((invoice) => {
+                      const direction = kind === "customers" ? "customer" : "supplier";
+                      const displayStatus = getInvoiceDisplayStatus({
+                        invoiceType: direction,
+                        customerId: null,
+                        supplierId: null,
+                        total: invoice.total,
+                        paidAmount: invoice.paidAmount,
+                        status: invoice.status,
+                        dueDate: invoice.dueDate,
+                      });
+                      const statusTone = displayStatus === "overdue" || displayStatus === "payment_inconsistent"
+                        ? "danger"
+                        : displayStatus === "paid" ? "success"
+                          : displayStatus === "unclassified" ? "neutral" : "warning";
+                      return (
+                        <Link className="contact-invoice-row" href={`/invoices#invoice-${invoice.id}`} key={invoice.id}>
+                          <span><strong>{invoice.invoiceNumber || "Brouillon sans numéro"}</strong><small>{invoice.issueDate || "Date inconnue"} · Échéance {invoice.dueDate || "non renseignée"}</small></span>
+                          <span>{invoice.total === null || !invoice.currency ? "Montant à vérifier" : formatMoney(invoice.total, invoice.currency)}{invoice.paidAmount ? <small>Reste {formatMoney(getInvoiceRemainingAmount(invoice.total, invoice.paidAmount, invoice.status) ?? 0, invoice.currency ?? "EUR")}</small> : null}<Badge tone={statusTone}>{invoiceStatusLabel(displayStatus, direction)}</Badge></span>
+                        </Link>
+                      );
+                    })}
                   </div>
                 ) : <p className="dashboard-empty-message">Aucune facture n’est explicitement associée à cette fiche. Les anciennes factures sans relation restent inchangées.</p>}
                 {kind === "suppliers" ? (

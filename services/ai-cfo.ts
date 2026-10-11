@@ -1,4 +1,5 @@
 import { buildDashboardSummary, type DashboardAction } from "@/services/dashboard";
+import { getInvoiceRemainingAmount } from "@/services/invoice-validation";
 import type { ExpenseRecord } from "@/services/expenses";
 import type { InvoiceCompany, InvoiceRecord } from "@/types/invoice";
 
@@ -97,8 +98,10 @@ export function buildCFOAnalysis(
   const upcoming = summary.alerts.filter((action) => action.kind === "upcoming");
   const activeInvoices = invoices.filter((invoice) => (
     ["pending", "receivable", "overdue"].includes(invoice.status)
+      && (getInvoiceRemainingAmount(invoice.total, invoice.paidAmount, invoice.status) ?? 0) > 0
   ));
-  const paidInvoices = invoices.filter((invoice) => invoice.status === "paid");
+  const paidInvoices = invoices.filter((invoice) => invoice.status === "paid"
+    || getInvoiceRemainingAmount(invoice.total, invoice.paidAmount, invoice.status) === 0);
 
   const expenseCurrencies = new Map<string, { total: number; pending: number; paid: number }>();
   for (const expense of expenses) {
@@ -117,7 +120,10 @@ export function buildCFOAnalysis(
     upcoming,
     unpaidCount: activeInvoices.length,
     paidCount: paidInvoices.length,
-    paidTotals: totalsByCurrency(paidInvoices.map(({ total, currency }) => ({ amount: total, currency }))),
+    paidTotals: totalsByCurrency(paidInvoices.map((invoice) => ({
+      amount: invoice.paidAmount ?? (invoice.status === "paid" ? invoice.total : 0),
+      currency: invoice.currency,
+    }))),
     pendingTotals: summary.payableTotals,
     receivableTotals: summary.receivableTotals,
     overdueTotals: summary.overdueTotals,

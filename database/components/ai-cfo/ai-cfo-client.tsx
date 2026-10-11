@@ -15,6 +15,7 @@ interface AiCfoClientProps {
   expenses: ExpenseRecord[];
   companies: Pick<InvoiceCompany, "id" | "name">[];
   invoiceError: string | null;
+  invoiceWarning?: string | null;
   expenseError: string | null;
   companyWarning?: string | null;
   asOfDate: string;
@@ -43,6 +44,7 @@ export function AiCfoClient({
   expenses,
   companies,
   invoiceError,
+  invoiceWarning = null,
   expenseError,
   companyWarning = null,
   asOfDate,
@@ -88,6 +90,7 @@ export function AiCfoClient({
       </p>
 
       {invoiceError ? <p className="auth-message is-error invoice-message" role="alert">{invoiceError}</p> : null}
+      {invoiceWarning ? <p className="invoice-overview-warning" role="status">{invoiceWarning}</p> : null}
       {expenseError ? <p className="auth-message is-error invoice-message" role="alert">{expenseError}</p> : null}
       {companyWarning ? <p className="auth-message invoice-message" role="status">{companyWarning}</p> : null}
 

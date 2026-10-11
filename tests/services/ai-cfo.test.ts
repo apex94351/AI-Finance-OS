@@ -8,6 +8,7 @@ function invoice(id: string, overrides: Partial<InvoiceRecord> = {}): InvoiceRec
     id,
     userId: null,
     companyId: null,
+    invoiceType: "customer",
     documentId: null,
     invoiceNumber: `FAC-${id}`,
     clientName: "Client",
@@ -71,10 +72,10 @@ describe("AI CFO deterministic analysis", () => {
 
   it("keeps payable, receivable, overdue, paid, and expense totals separated by currency", () => {
     const analysis = buildCFOAnalysis([
-      invoice("eur-payable", { supplierId: "supplier", total: 10, currency: "EUR" }),
-      invoice("usd-payable", { supplierId: "supplier", total: 20, currency: "USD" }),
+      invoice("eur-payable", { invoiceType: "supplier", supplierId: "supplier", total: 10, currency: "EUR" }),
+      invoice("usd-payable", { invoiceType: "supplier", supplierId: "supplier", total: 20, currency: "USD" }),
       invoice("receivable", { customerId: "customer", status: "receivable", total: 30, currency: "EUR" }),
-      invoice("late", { supplierId: "supplier", status: "overdue", total: 40, currency: "GBP", dueDate: "2026-01-01" }),
+      invoice("late", { invoiceType: "supplier", supplierId: "supplier", status: "overdue", total: 40, currency: "GBP", dueDate: "2026-01-01" }),
       invoice("paid", { status: "paid", total: 50, currency: "USD" }),
     ], [
       expense("expense-eur", { amount: 5 }),
@@ -107,7 +108,7 @@ describe("AI CFO deterministic analysis", () => {
     expect(incomplete.pendingTotals).toEqual([]);
     expect(incomplete.recommendations).toHaveLength(1);
     expect(incomplete.recommendations[0]?.priority).toBe("review");
-    expect(incomplete.recommendations[0]?.evidence).toContain("échéance absente ou invalide");
+    expect(incomplete.recommendations[0]?.evidence).toMatch(/échéance absente ou invalide/i);
   });
 
   it("provides explicit priority evidence and scopes records to the selected workspace", () => {

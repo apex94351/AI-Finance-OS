@@ -9,7 +9,7 @@ const { getAuthenticatedSupabase, revalidatePath, from } = vi.hoisted(() => ({
 vi.mock("@/lib/supabase/server", () => ({ getAuthenticatedSupabase }));
 vi.mock("next/cache", () => ({ revalidatePath }));
 
-import { deleteInvoice, markInvoiceSettled, saveInvoice, updateInvoicePaymentStatus } from "@/app/invoices/actions";
+import { deleteInvoice, markInvoiceSettled, recordInvoicePayment, saveInvoice, updateInvoicePaymentStatus } from "@/app/invoices/actions";
 
 const companyId = "123e4567-e89b-42d3-a456-426614174000";
 const invoiceId = "123e4567-e89b-42d3-a456-426614174002";
@@ -20,6 +20,7 @@ function invoiceForm(overrides: Record<string, string> = {}) {
     companyId,
     invoiceNumber: "FAC-2026-001",
     clientName: "Client Exemple",
+    invoiceType: "customer",
     description: "Prestation de conseil",
     subtotal: "100",
     vatRate: "20",
@@ -78,6 +79,7 @@ function setup({
     select: vi.fn(),
     maybeSingle: vi.fn(),
   };
+  const rpc = vi.fn().mockResolvedValue({ error: null });
   invoiceQuery.insert.mockReturnValue(invoiceQuery);
   invoiceQuery.update.mockReturnValue(invoiceQuery);
   invoiceQuery.delete.mockReturnValue(invoiceQuery);
@@ -100,10 +102,10 @@ function setup({
     return invoiceQuery;
   });
   getAuthenticatedSupabase.mockResolvedValue({
-    supabase: { from },
+    supabase: { from, rpc },
     user: { id: "123e4567-e89b-42d3-a456-426614174001" },
   });
-  return { membershipQuery, companyQuery, contactQuery, documentQuery, invoiceQuery };
+  return { membershipQuery, companyQuery, contactQuery, documentQuery, invoiceQuery, rpc };
 }
 
 describe("invoice actions", () => {
@@ -127,6 +129,7 @@ describe("invoice actions", () => {
     expect(companyQuery.eq).toHaveBeenCalledWith("id", companyId);
     expect(invoiceQuery.insert).toHaveBeenCalledWith(expect.objectContaining({
       company_id: companyId,
+      invoice_type: "customer",
       document_id: null,
       subtotal_ht: 100,
       vat_amount: 20,
@@ -137,7 +140,7 @@ describe("invoice actions", () => {
     expect(revalidatePath).toHaveBeenCalledWith("/invoices");
   });
 
-  it("persists a manually selected overdue status before the due date", async () => {
+  it("rejects a manually selected overdue status before the due date", async () => {
     const { invoiceQuery } = setup();
 
     const result = await saveInvoice({}, invoiceForm({
@@ -145,8 +148,8 @@ describe("invoice actions", () => {
       status: "overdue",
     }));
 
-    expect(invoiceQuery.insert).toHaveBeenCalledWith(expect.objectContaining({ status: "overdue" }));
-    expect(result.success).toContain("enregistrée");
+    expect(invoiceQuery.insert).not.toHaveBeenCalled();
+    expect(result.error).toContain("après sa date d’échéance");
   });
 
   it("automatically persists overdue for an unpaid invoice past its due date", async () => {
@@ -219,6 +222,48 @@ describe("invoice actions", () => {
     expect(result.success).toContain("enregistrée");
   });
 
+  it("rejects an invoice direction that conflicts with its linked counterparty", async () => {
+    const { invoiceQuery } = setup();
+
+    const result = await saveInvoice({}, invoiceForm({
+      invoiceType: "supplier",
+      customerId: "123e4567-e89b-42d3-a456-426614174003",
+    }));
+
+    expect(result.error).toContain("doit correspondre au tiers");
+    expect(invoiceQuery.insert).not.toHaveBeenCalled();
+  });
+
+  it("falls back to a validated party relation when the remote schema has no invoice_type", async () => {
+    const { invoiceQuery } = setup();
+    invoiceQuery.maybeSingle
+      .mockResolvedValueOnce({ data: null, error: { code: "42703", message: "column invoice_type does not exist" } })
+      .mockResolvedValueOnce({ data: { id: invoiceId }, error: null });
+
+    const result = await saveInvoice({}, invoiceForm({ customerId: "123e4567-e89b-42d3-a456-426614174003" }));
+
+    expect(invoiceQuery.insert).toHaveBeenCalledTimes(2);
+    expect(invoiceQuery.insert.mock.calls[1]?.[0]).toMatchObject({
+      customer_id: "123e4567-e89b-42d3-a456-426614174003",
+      supplier_id: null,
+    });
+    expect(invoiceQuery.insert.mock.calls[1]?.[0]).not.toHaveProperty("invoice_type");
+    expect(result.success).toContain("enregistrée");
+  });
+
+  it("does not persist a guessed direction on an old schema without a confirming relation", async () => {
+    const { invoiceQuery } = setup();
+    invoiceQuery.maybeSingle.mockResolvedValueOnce({
+      data: null,
+      error: { code: "PGRST204", message: "Could not find invoice_type column in schema cache" },
+    });
+
+    const result = await saveInvoice({}, invoiceForm());
+
+    expect(invoiceQuery.insert).toHaveBeenCalledTimes(1);
+    expect(result.error).toContain("associez explicitement un client/fournisseur");
+  });
+
   it("creates a supplier invoice linked to a verified source document", async () => {
     const documentId = "123e4567-e89b-42d3-a456-426614174004";
     const supplierId = "123e4567-e89b-42d3-a456-426614174005";
@@ -233,6 +278,7 @@ describe("invoice actions", () => {
 
     const result = await saveInvoice({}, invoiceForm({
       supplierId,
+      invoiceType: "supplier",
       clientName: "Nom falsifié côté navigateur",
       documentId,
     }));
@@ -243,6 +289,7 @@ describe("invoice actions", () => {
     expect(invoiceQuery.insert).toHaveBeenCalledWith(expect.objectContaining({
       document_id: documentId,
       supplier_id: supplierId,
+      invoice_type: "supplier",
       client_name: "Fournisseur Exemple",
     }));
     expect(result.success).toContain("enregistrée");
@@ -347,6 +394,43 @@ describe("invoice actions", () => {
     expect(invoiceQuery.eq).toHaveBeenNthCalledWith(2, "company_id", companyId);
     expect(invoiceQuery.is).toHaveBeenCalledWith("user_id", null);
     expect(result.success).toContain("enregistrée");
+  });
+
+  it("records a customer payment only after checking membership and delegates balance validation to the RPC", async () => {
+    const { membershipQuery, rpc } = setup();
+
+    const result = await recordInvoicePayment(companyId, invoiceId, "2026-10-03", "25,50", "VIR-01", "Acompte");
+
+    expect(membershipQuery.eq).toHaveBeenCalledWith("company_id", companyId);
+    expect(rpc).toHaveBeenCalledWith("record_invoice_payment", {
+      target_invoice_id: invoiceId,
+      target_payment_date: "2026-10-03",
+      target_amount: 25.5,
+      target_reference: "VIR-01",
+      target_note: "Acompte",
+    });
+    expect(result.success).toContain("enregistré");
+    expect(revalidatePath).toHaveBeenCalledWith("/due-dates");
+  });
+
+  it("rejects invalid payment input and displays an overpayment response", async () => {
+    const { rpc } = setup();
+    const invalid = await recordInvoicePayment(companyId, invoiceId, "2026-10-03", "0", "", "");
+    expect(invalid.error).toContain("montant");
+    expect(rpc).not.toHaveBeenCalled();
+
+    rpc.mockResolvedValueOnce({ error: { code: "22003" } });
+    const overpayment = await recordInvoicePayment(companyId, invoiceId, "2026-10-03", "150", "", "");
+    expect(overpayment.error).toContain("dépasse le solde restant");
+  });
+
+  it("does not call the payment RPC when the user lacks company membership", async () => {
+    const { rpc } = setup({ membership: { data: null, error: null } });
+
+    const result = await recordInvoicePayment(companyId, invoiceId, "2026-10-03", "25", "", "");
+
+    expect(result.error).toContain("n’est pas associée");
+    expect(rpc).not.toHaveBeenCalled();
   });
 
   it("deletes only the selected invoice inside the selected company", async () => {

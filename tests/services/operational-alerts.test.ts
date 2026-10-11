@@ -7,6 +7,7 @@ function invoice(id: string, overrides: Partial<InvoiceRecord> = {}): InvoiceRec
     id,
     userId: null,
     companyId: null,
+    invoiceType: "customer",
     documentId: null,
     invoiceNumber: `FAC-${id}`,
     clientName: "Client",

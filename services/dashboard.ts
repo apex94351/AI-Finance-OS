@@ -1,6 +1,6 @@
 import type { InvoiceRecord } from "@/types/invoice";
 import type { ExpenseRecord } from "@/services/expenses";
-import { getEffectiveInvoiceStatus } from "@/services/invoice-validation";
+import { getEffectiveInvoiceStatus, getInvoiceDirection, getInvoiceRemainingAmount } from "@/services/invoice-validation";
 
 export interface CurrencyTotal {
   currency: string;
@@ -128,8 +128,7 @@ export function resolveDashboardDateRange(
 }
 
 function isCustomerInvoice(invoice: InvoiceRecord): boolean {
-  return Boolean(invoice.customerId)
-    || (!invoice.supplierId && invoice.partyLinksAvailable !== false && Boolean(invoice.clientName));
+  return getInvoiceDirection(invoice) === "customer";
 }
 
 function isOpenInvoice(invoice: InvoiceRecord, asOfDate: string): boolean {
@@ -138,8 +137,9 @@ function isOpenInvoice(invoice: InvoiceRecord, asOfDate: string): boolean {
 }
 
 function invoiceBalance(invoice: InvoiceRecord, asOfDate: string): number | null {
-  if (!isOpenInvoice(invoice, asOfDate) || invoice.total === null || !Number.isFinite(invoice.total) || invoice.total <= 0) return null;
-  return invoice.total;
+  if (!isOpenInvoice(invoice, asOfDate)) return null;
+  const remaining = invoice.remainingAmount ?? getInvoiceRemainingAmount(invoice.total, invoice.paidAmount, invoice.status);
+  return remaining !== null && remaining > 0 ? remaining : null;
 }
 
 function addMoney(totals: Map<string, number>, amount: number | null, currency: string | null) {
@@ -214,7 +214,7 @@ export function buildDashboardCockpit(
   for (const invoice of invoices) {
     const balance = invoiceBalance(invoice, asOfDate);
     if (balance !== null) {
-      if (invoice.supplierId) addMoney(payableTotals, balance, invoice.currency);
+      if (getInvoiceDirection(invoice) === "supplier") addMoney(payableTotals, balance, invoice.currency);
       else if (isCustomerInvoice(invoice)) addMoney(receivableTotals, balance, invoice.currency);
 
       const dueOrdinal = dateOrdinal(invoice.dueDate);
@@ -223,10 +223,10 @@ export function buildDashboardCockpit(
           overdueInvoices.push(invoice);
           if (isCustomerInvoice(invoice)) overdueCustomerInvoices.push(invoice);
         }
-        if (invoice.supplierId && dueOrdinal >= todayOrdinal && dueOrdinal - todayOrdinal <= 30) {
+        if (getInvoiceDirection(invoice) === "supplier" && dueOrdinal >= todayOrdinal && dueOrdinal - todayOrdinal <= 30) {
           upcomingSupplierInvoices.push(invoice);
         }
-        if ((invoice.supplierId || isCustomerInvoice(invoice))
+        if ((getInvoiceDirection(invoice) !== null)
           && dueOrdinal >= todayOrdinal && dueOrdinal - todayOrdinal <= 30) upcomingInvoices.push(invoice);
       }
     }
@@ -306,10 +306,25 @@ export function buildDashboardSummary(invoices: InvoiceRecord[], asOfDate: strin
       continue;
     }
     if (status !== "pending" && status !== "overdue") continue;
+    const remaining = invoiceBalance(invoice, asOfDate);
+    if (remaining === null) {
+      const reason = dateOrdinal(invoice.dueDate) === null
+        ? "Échéance absente ou invalide · montant restant à vérifier"
+        : "Montant restant à vérifier";
+      actions.push({ invoice, kind: "verify", daysUntilDue: null, reason });
+      continue;
+    }
+    if (remaining <= 0) continue;
+    const direction = getInvoiceDirection(invoice);
+    if (direction === null) {
+      actions.push({ invoice, kind: "verify", daysUntilDue: null, reason: "Sens financier de la facture à préciser" });
+      continue;
+    }
     toProcessCount += 1;
 
-    if (invoice.supplierId) addCurrencyTotal(payableTotals, invoice);
-    else if (isCustomerInvoice(invoice)) addCurrencyTotal(receivableTotals, invoice);
+    const balanceInvoice = { ...invoice, total: remaining };
+    if (direction === "supplier") addCurrencyTotal(payableTotals, balanceInvoice);
+    else addCurrencyTotal(receivableTotals, balanceInvoice);
 
     const dueDay = dateOrdinal(invoice.dueDate);
     if (dueDay === null || today === null) {
@@ -319,8 +334,8 @@ export function buildDashboardSummary(invoices: InvoiceRecord[], asOfDate: strin
 
     const daysUntilDue = dueDay - today;
     if (daysUntilDue < 0) {
-      addCurrencyTotal(overdueTotals, invoice);
-      const reason = invoice.total === null || !Number.isFinite(invoice.total) || !invoice.currency || !/^[A-Z]{3}$/.test(invoice.currency)
+      addCurrencyTotal(overdueTotals, balanceInvoice);
+      const reason = !invoice.currency || !/^[A-Z]{3}$/.test(invoice.currency)
         ? "Échéance dépassée · montant ou devise à vérifier"
         : "Échéance dépassée";
       actions.push({ invoice, kind: "overdue", daysUntilDue, reason });

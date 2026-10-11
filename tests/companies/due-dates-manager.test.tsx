@@ -58,13 +58,69 @@ describe("deadline manager", () => {
       />,
     );
 
-    expect(screen.getByText("Total à encaisser")).toBeTruthy();
-    expect(screen.getByText("Total à payer")).toBeTruthy();
-    expect(screen.getByText("Solde prévisionnel")).toBeTruthy();
-    expect(screen.getByText(/120,00/)).toBeTruthy();
-    expect(screen.getByText(/155,00/)).toBeTruthy();
-    expect(screen.getByText(/35,00/)).toBeTruthy();
+    const indicators = screen.getByRole("region", { name: "Prévisionnel des échéances" });
+    expect(within(indicators).getByText("Total à encaisser")).toBeTruthy();
+    expect(within(indicators).getByText("Total à payer")).toBeTruthy();
+    expect(within(indicators).getByText("Solde prévisionnel")).toBeTruthy();
+    expect(within(indicators).getByText(/120,00/)).toBeTruthy();
+    expect(within(indicators).getByText(/155,00/)).toBeTruthy();
+    expect(within(indicators).getByText(/35,00/)).toBeTruthy();
     expect(screen.getByText(/ne représente pas le solde bancaire réel/)).toBeTruthy();
+  });
+
+  it("includes undated expenses in totals without showing them as dated deadlines", () => {
+    render(
+      <DeadlineManager
+        invoices={[{
+          id: "undated-expense",
+          sourceType: "expense",
+          companyId: null,
+          supplierId: "supplier-1",
+          invoiceNumber: null,
+          clientName: "Abonnement",
+          label: "Abonnement",
+          dueDate: null,
+          total: 75,
+          grossTotal: 100,
+          paidAmount: 25,
+          currency: "EUR",
+          status: "pending",
+        }]}
+        loadError={null}
+        asOfDate="2026-10-10"
+      />,
+    );
+
+    const indicators = screen.getByRole("region", { name: "Prévisionnel des échéances" });
+    const cards = within(indicators).getAllByRole("article");
+    expect(cards[1]?.textContent).toContain("75,00");
+    expect(cards[2]?.textContent).toContain("-75,00");
+    expect(screen.getByText("Aucune échéance active")).toBeTruthy();
+  });
+
+  it("keeps a one-cent forecast balance visually neutral", () => {
+    render(
+      <DeadlineManager
+        invoices={[{
+          id: "one-cent-invoice",
+          companyId: null,
+          customerId: "customer-1",
+          invoiceNumber: "CLI-ONE-CENT",
+          clientName: "Client Exemple",
+          dueDate: "2026-10-15",
+          total: 0.01,
+          currency: "EUR",
+          status: "receivable",
+        }]}
+        loadError={null}
+        asOfDate="2026-10-10"
+      />,
+    );
+
+    const indicators = screen.getByRole("region", { name: "Prévisionnel des échéances" });
+    const cards = within(indicators).getAllByRole("article");
+    expect(cards[2]?.className).not.toContain("is-positive");
+    expect(cards[2]?.className).not.toContain("is-negative");
   });
 
   it("exposes exactly the requested filters and retains late obligations in all", () => {

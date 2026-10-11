@@ -21,7 +21,7 @@ function today() {
 }
 
 function editableStatus(status: InvoiceStatus | undefined): InvoicePaymentStatus {
-  return status === "paid" || status === "overdue" ? status : "pending";
+  return status === "paid" ? "paid" : "pending";
 }
 
 export function InvoiceForm({
@@ -51,7 +51,10 @@ export function InvoiceForm({
   const [companyId, setCompanyId] = useState(invoice?.companyId ?? initialCompanyId);
   const [contactChoices, setContactChoices] = useState(contacts);
   const [partyKind, setPartyKind] = useState<"none" | ContactKind>(() => (
-    invoice?.customerId ? "customers" : invoice?.supplierId ? "suppliers"
+    invoice?.invoiceType === "customer" ? "customers" : invoice?.invoiceType === "supplier" ? "suppliers"
+      : invoice?.customerId ? "customers" : invoice?.supplierId ? "suppliers"
+        : invoice?.sourceDocumentCategory === "customer_invoice" ? "customers"
+          : invoice?.sourceDocumentCategory === "supplier_invoice" ? "suppliers"
       : sourceDocument?.category === "customer_invoice" ? "customers"
         : sourceDocument?.category === "supplier_invoice" ? "suppliers"
       : initialPartyType === "customer" ? "customers" : initialPartyType === "supplier" ? "suppliers" : "none"
@@ -168,7 +171,7 @@ export function InvoiceForm({
           </div>
         ) : (
           <label className="invoice-field">
-            <span>Type de tiers associé</span>
+            <span>Sens de la facture</span>
             <select
               value={partyKind}
               onChange={(event) => {
@@ -176,9 +179,9 @@ export function InvoiceForm({
                 setPartyId("");
               }}
             >
-              <option value="none">Aucune association</option>
-              <option value="customers">Client</option>
-              <option value="suppliers">Fournisseur</option>
+              <option value="none">À préciser</option>
+              <option value="customers">Facture client · à encaisser</option>
+              <option value="suppliers">Facture fournisseur · à payer</option>
             </select>
           </label>
         )}
@@ -213,6 +216,7 @@ export function InvoiceForm({
         ) : null}
         <input type="hidden" name="customerId" value={partyKind === "customers" ? partyId : ""} />
         <input type="hidden" name="supplierId" value={partyKind === "suppliers" ? partyId : ""} />
+        <input type="hidden" name="invoiceType" value={partyKind === "customers" ? "customer" : partyKind === "suppliers" ? "supplier" : ""} />
         {invoice?.customerId || invoice?.supplierId ? <input type="hidden" name="counterpartyUpdate" value="true" /> : null}
         <label className="invoice-field">
           <span>{selectedParty ? "Nom du tiers associé" : partyKind === "suppliers" ? "Nom du fournisseur" : "Nom du client"}</span>
@@ -249,9 +253,8 @@ export function InvoiceForm({
         <label className="invoice-field">
           <span>Statut</span>
           <select name="status" value={status} onChange={(event) => setStatus(event.target.value as typeof status)} required>
-            <option value="pending">À payer</option>
-            <option value="paid">Payée</option>
-            <option value="overdue">En retard</option>
+              <option value="pending">{partyKind === "customers" ? "Impayée" : "À payer"}</option>
+              {partyKind !== "customers" || invoice?.status === "paid" ? <option value="paid">Payée</option> : null}
           </select>
         </label>
       </div>

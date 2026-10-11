@@ -2,6 +2,7 @@ import { z } from "zod";
 import { AppShell } from "@/database/components/app-shell";
 import { DeadlineManager } from "@/database/components/due-dates/deadline-manager";
 import { getAuthenticatedSupabase } from "@/lib/supabase/server";
+import { getVerifiedInvoiceSourceDocumentCategory } from "@/services/invoice-validation";
 import type { DueDateRecord } from "@/services/due-dates";
 
 const membershipSchema = z.array(z.object({ company_id: z.uuid() }));
@@ -12,10 +13,13 @@ const amountSchema = z.union([
 ]).nullable();
 const invoiceSchema = z.array(z.object({
   id: z.uuid(),
+  user_id: z.uuid().nullable().optional(),
   company_id: z.uuid().nullable(),
+  invoice_type: z.enum(["customer", "supplier"]).nullable().optional(),
   customer_id: z.uuid().nullable().optional(),
   supplier_id: z.uuid().nullable().optional(),
   invoice_number: z.string().nullable(),
+  document_id: z.uuid().nullable().optional(),
   client_name: z.string().nullable(),
   due_date: z.string().nullable(),
   total_ttc: amountSchema,
@@ -38,9 +42,21 @@ const expensePaymentSchema = z.array(z.object({
   expense_id: z.uuid(),
   amount: z.union([z.number(), z.string().regex(/^\d+(?:\.\d+)?$/).transform(Number)]),
 }));
+const invoicePaymentSchema = z.array(z.object({
+  invoice_id: z.uuid(),
+  amount: z.union([z.number(), z.string().regex(/^\d+(?:\.\d+)?$/).transform(Number)]),
+}));
 
 const invoiceColumns = "id, company_id, invoice_number, client_name, due_date, total_ttc, currency, status";
-const invoiceColumnsWithParties = `${invoiceColumns}, customer_id, supplier_id`;
+const invoiceColumnsWithParties = `${invoiceColumns}, user_id, document_id, customer_id, supplier_id`;
+const invoiceColumnsWithType = `${invoiceColumnsWithParties}, invoice_type`;
+const invoiceColumnsWithLegacyParties = `${invoiceColumns}, customer_id, supplier_id`;
+const sourceDocumentSchema = z.array(z.object({
+  id: z.uuid(),
+  user_id: z.uuid().nullable(),
+  company_id: z.uuid().nullable(),
+  category: z.string(),
+}));
 type AuthenticatedSupabase = Awaited<ReturnType<typeof getAuthenticatedSupabase>>["supabase"];
 
 async function queryInvoices(supabase: AuthenticatedSupabase, userId: string, companyIds: string[] | null) {
@@ -51,20 +67,33 @@ async function queryInvoices(supabase: AuthenticatedSupabase, userId: string, co
       : await query.eq("user_id", userId).is("company_id", null);
   }
 
-  const result = await select(invoiceColumnsWithParties);
-  if (!result.error) return { data: result.data as unknown[], error: null, hasPartyLinks: true };
+    const result = await select(invoiceColumnsWithType);
+  if (!result.error) return { data: result.data as unknown[], error: null, hasPartyLinks: true, hasInvoiceType: true };
   if (!["42703", "PGRST204"].includes(result.error.code)) {
-    return { data: [] as unknown[], error: result.error, hasPartyLinks: false };
+    return { data: [] as unknown[], error: result.error, hasPartyLinks: false, hasInvoiceType: false };
+  }
+  const partiesFallback = await select(invoiceColumnsWithParties);
+  if (!partiesFallback.error) {
+    return { data: partiesFallback.data as unknown[], error: null, hasPartyLinks: true, hasInvoiceType: false };
+  }
+  const legacyPartiesFallback = await select(invoiceColumnsWithLegacyParties);
+  if (!legacyPartiesFallback.error) {
+    return { data: legacyPartiesFallback.data as unknown[], error: null, hasPartyLinks: true, hasInvoiceType: false };
   }
   const fallback = await select(invoiceColumns);
-  return { data: (fallback.data ?? []) as unknown[], error: fallback.error, hasPartyLinks: false };
+  return { data: (fallback.data ?? []) as unknown[], error: fallback.error, hasPartyLinks: false, hasInvoiceType: false };
 }
 
-function mapInvoice(invoice: z.infer<typeof invoiceSchema>[number]): DueDateRecord {
+function mapInvoice(
+  invoice: z.infer<typeof invoiceSchema>[number],
+  sourceDocumentCategory: "customer_invoice" | "supplier_invoice" | null = null,
+): DueDateRecord {
   return {
     id: invoice.id,
     sourceType: "invoice",
     companyId: invoice.company_id,
+    invoiceType: invoice.invoice_type ?? null,
+    sourceDocumentCategory,
     customerId: invoice.customer_id ?? null,
     supplierId: invoice.supplier_id ?? null,
     invoiceNumber: invoice.invoice_number,
@@ -117,6 +146,7 @@ export default async function DueDatesPage() {
   }
   let companyRowsForInvoices: unknown[] = [];
   let companyHasPartyLinks = true;
+  let companyHasInvoiceType = true;
   if (companyIds.length) {
     const companyResult = await queryInvoices(supabase, user.id, companyIds);
     if (companyResult.error) {
@@ -125,6 +155,7 @@ export default async function DueDatesPage() {
     }
     companyRowsForInvoices = companyResult.data;
     companyHasPartyLinks = companyResult.hasPartyLinks;
+    companyHasInvoiceType = companyResult.hasInvoiceType;
   }
 
   const parsedInvoices = invoiceSchema.safeParse([...personalResult.data, ...companyRowsForInvoices]);
@@ -132,14 +163,44 @@ export default async function DueDatesPage() {
     console.error("Due date query returned an unexpected result");
     return <AppShell pageTitle="dueDates"><DeadlineManager invoices={[]} loadError="Les échéances reçues ne sont pas au format attendu." asOfDate={asOfDate} /></AppShell>;
   }
-  const invoices = parsedInvoices.data.map(mapInvoice);
+  let sourceDocumentWarning: string | null = null;
+  const sourceDocumentIds = [...new Set(parsedInvoices.data.flatMap(({ document_id }) => document_id ? [document_id] : []))];
+  const categoriesByInvoice = new Map<string, "customer_invoice" | "supplier_invoice">();
+  if (sourceDocumentIds.length) {
+    const documentResult = await supabase.from("documents")
+      .select("id, user_id, company_id, category")
+      .in("id", sourceDocumentIds);
+    const documents = sourceDocumentSchema.safeParse(documentResult.data ?? []);
+    if (documentResult.error || !documents.success) {
+      console.error("Due date source document lookup failed", { code: documentResult.error?.code ?? "INVALID_RESULT" });
+      sourceDocumentWarning = "Certaines factures liées à un document ne peuvent pas être qualifiées depuis sa catégorie.";
+    } else {
+      for (const invoice of parsedInvoices.data) {
+        if (!invoice.document_id || (!invoice.user_id && !invoice.company_id)) continue;
+        const document = documents.data.find(({ id }) => id === invoice.document_id);
+        if (!document) continue;
+        const category = getVerifiedInvoiceSourceDocumentCategory({
+          documentId: invoice.document_id,
+          userId: invoice.user_id ?? null,
+          companyId: invoice.company_id,
+        }, {
+          id: document.id,
+          userId: document.user_id,
+          companyId: document.company_id,
+          category: document.category,
+        });
+        if (category) categoriesByInvoice.set(invoice.id, category);
+      }
+    }
+  }
+  const invoices = parsedInvoices.data.map((invoice) => mapInvoice(invoice, categoriesByInvoice.get(invoice.id) ?? null));
   let expenseDataWarning: string | null = null;
   const [personalExpenseResult, companyExpenseResult, personalLinkedExpenseResult, companyLinkedExpenseResult] = await Promise.all([
     supabase.from("expenses").select("id, company_id, label, due_date, amount, currency, status, supplier_id, invoice_id")
-      .eq("user_id", user.id).is("company_id", null).not("due_date", "is", null).is("invoice_id", null),
+      .eq("user_id", user.id).is("company_id", null).is("invoice_id", null),
     companyIds.length
       ? supabase.from("expenses").select("id, company_id, label, due_date, amount, currency, status, supplier_id, invoice_id")
-        .in("company_id", companyIds).is("user_id", null).not("due_date", "is", null).is("invoice_id", null)
+        .in("company_id", companyIds).is("user_id", null).is("invoice_id", null)
       : Promise.resolve({ data: [], error: null }),
     supabase.from("expenses").select("id, company_id, label, due_date, amount, currency, status, supplier_id, invoice_id")
       .eq("user_id", user.id).is("company_id", null).not("invoice_id", "is", null),
@@ -154,54 +215,85 @@ export default async function DueDatesPage() {
     ?? companyLinkedExpenseResult.error;
   const expenseSchemaUnavailable = Boolean(expenseQueryError
     && ["42703", "42P01", "PGRST202", "PGRST204", "PGRST205"].includes(expenseQueryError.code ?? ""));
-  if (expenseQueryError && !expenseSchemaUnavailable) {
+  const expenseDataAvailable = !expenseQueryError;
+  if (expenseQueryError) {
     console.error("Due date expense query failed", { code: expenseQueryError.code });
-    return <AppShell pageTitle="dueDates"><DeadlineManager invoices={[]} loadError="Impossible de charger les échéances de dépenses. Vérifiez la migration corrective 016_supabase_managed_schedulers.sql." asOfDate={asOfDate} /></AppShell>;
-  }
-  if (expenseSchemaUnavailable) {
-    console.error("Due date expense query requires migration 015", { code: expenseQueryError?.code });
-    expenseDataWarning = "Les échéances de dépenses nécessitent la migration corrective locale 016_supabase_managed_schedulers.sql.";
+    expenseDataWarning = expenseSchemaUnavailable
+      ? "Les dépenses nécessitent les migrations 015/016 et restent temporairement indisponibles ; les factures continuent d’être affichées."
+      : "Les dépenses n’ont pas pu être lues avec les permissions ou le schéma actuels ; les factures restent affichées.";
   }
   const parsedExpenses = expenseSchema.safeParse(expenseSchemaUnavailable
     ? []
-    : [
+    : expenseDataAvailable ? [
       ...(personalExpenseResult.data ?? []),
       ...(companyExpenseResult.data ?? []),
       ...(personalLinkedExpenseResult.data ?? []),
       ...(companyLinkedExpenseResult.data ?? []),
-    ]);
+    ] : []);
   if (!parsedExpenses.success) {
     console.error("Due date expense query returned an unexpected result");
-    return <AppShell pageTitle="dueDates"><DeadlineManager invoices={[]} loadError="Les échéances de dépenses reçues ne sont pas au format attendu." asOfDate={asOfDate} /></AppShell>;
+    expenseDataWarning = [expenseDataWarning, "Les dépenses reçues ne sont pas au format attendu ; elles sont omises, les factures restent affichées."]
+      .filter(Boolean).join(" ");
   }
-  const expenseIds = parsedExpenses.data.map(({ id }) => id);
+  const expenseRowsAvailable = expenseDataAvailable && parsedExpenses.success;
+  const expenseRows = expenseRowsAvailable ? parsedExpenses.data : [];
+  const expenseIds = expenseRows.map(({ id }) => id);
   const paymentResult = expenseIds.length
     ? await supabase.from("expense_payments").select("expense_id, amount").in("expense_id", expenseIds)
     : { data: [], error: null };
   const paymentSchemaUnavailable = Boolean(paymentResult.error
-    && ["42P01", "PGRST202", "PGRST205"].includes(paymentResult.error.code ?? ""));
-  if (paymentResult.error && !paymentSchemaUnavailable) {
-    console.error("Due date expense payment query failed", { code: paymentResult.error.code });
-    return <AppShell pageTitle="dueDates"><DeadlineManager invoices={[]} loadError="Impossible de charger les paiements des dépenses. Vérifiez la migration corrective 016_supabase_managed_schedulers.sql." asOfDate={asOfDate} /></AppShell>;
-  }
+    && ["42P01", "42703", "PGRST202", "PGRST204", "PGRST205"].includes(paymentResult.error.code ?? ""));
+  const expensePaymentQuerySucceeded = !paymentResult.error;
   if (paymentSchemaUnavailable) {
-    console.error("Due date expense payment query requires migration 015", { code: paymentResult.error?.code });
-    expenseDataWarning = [expenseDataWarning, "L’historique des paiements partiels est indisponible tant que la migration corrective 016 n’est pas installée."]
+    console.error("Due date expense payment query requires migration 016", { code: paymentResult.error?.code });
+    expenseDataWarning = [expenseDataWarning, "L’historique des paiements de dépenses nécessite la migration 016 ; les soldes concernés restent à vérifier."]
+      .filter(Boolean).join(" ");
+  } else if (paymentResult.error) {
+    console.error("Due date expense payment query failed", { code: paymentResult.error.code });
+    expenseDataWarning = [expenseDataWarning, "Les paiements de dépenses sont inaccessibles ; les soldes concernés restent à vérifier."]
       .filter(Boolean).join(" ");
   }
-  const parsedPayments = expensePaymentSchema.safeParse(paymentSchemaUnavailable ? [] : paymentResult.data ?? []);
+  const parsedPayments = expensePaymentSchema.safeParse(paymentResult.error ? [] : paymentResult.data ?? []);
+  const expensePaymentsAvailable = expenseRowsAvailable && expensePaymentQuerySucceeded && parsedPayments.success;
   if (!parsedPayments.success) {
     console.error("Due date expense payment query returned an unexpected result");
-    return <AppShell pageTitle="dueDates"><DeadlineManager invoices={[]} loadError="Les paiements reçus ne sont pas au format attendu." asOfDate={asOfDate} /></AppShell>;
+    expenseDataWarning = [expenseDataWarning, "L’historique des paiements reçus n’est pas au format attendu ; les soldes concernés restent à vérifier."]
+      .filter(Boolean).join(" ");
   }
   const paidByExpense = new Map<string, number>();
-  for (const payment of parsedPayments.data) {
+  for (const payment of parsedPayments.success ? parsedPayments.data : []) {
     paidByExpense.set(payment.expense_id, (paidByExpense.get(payment.expense_id) ?? 0) + payment.amount);
   }
-  const expenseItems: DueDateRecord[] = parsedExpenses.data
+  const invoiceIds = invoices.map(({ id }) => id);
+  const customerPaymentResult = invoiceIds.length
+    ? await supabase.from("invoice_payments").select("invoice_id, amount").in("invoice_id", invoiceIds)
+    : { data: [], error: null };
+  const customerPaymentSchemaUnavailable = Boolean(customerPaymentResult.error
+    && ["42P01", "42703", "PGRST202", "PGRST204", "PGRST205"].includes(customerPaymentResult.error.code ?? ""));
+  if (customerPaymentResult.error) {
+    console.error("Due date customer invoice payment query unavailable", { code: customerPaymentResult.error.code });
+    expenseDataWarning = [expenseDataWarning, customerPaymentSchemaUnavailable
+      ? "Les paiements partiels clients nécessitent la migration 017 ; les factures restent visibles selon leur statut enregistré."
+      : "Le registre des paiements clients est inaccessible ; les soldes correspondants restent à vérifier."]
+      .filter(Boolean).join(" ");
+  }
+  const parsedCustomerPayments = invoicePaymentSchema.safeParse(customerPaymentResult.error ? [] : customerPaymentResult.data ?? []);
+  const customerPaymentDataAvailable = !customerPaymentResult.error && parsedCustomerPayments.success;
+  if (!parsedCustomerPayments.success) {
+    console.error("Due date customer invoice payments returned an unexpected result");
+    expenseDataWarning = [expenseDataWarning, "Les paiements clients reçus ne sont pas au format attendu ; les soldes concernés restent à vérifier."]
+      .filter(Boolean).join(" ");
+  }
+  const paidByInvoice = new Map<string, number>();
+  for (const payment of parsedCustomerPayments.success ? parsedCustomerPayments.data : []) {
+    paidByInvoice.set(payment.invoice_id, Math.round(((paidByInvoice.get(payment.invoice_id) ?? 0) + payment.amount) * 100) / 100);
+  }
+  const expenseItems: DueDateRecord[] = expenseRows
     .filter((expense) => expense.invoice_id === null && expense.due_date !== null)
     .map((expense) => {
-    const paidAmount = Math.round((paidByExpense.get(expense.id) ?? (expense.status === "paid" ? expense.amount : 0)) * 100) / 100;
+    const paidAmount = expense.status === "paid" ? expense.amount
+      : expensePaymentsAvailable ? Math.round((paidByExpense.get(expense.id) ?? 0) * 100) / 100
+        : null;
     return {
       id: expense.id,
       sourceType: "expense",
@@ -212,7 +304,7 @@ export default async function DueDatesPage() {
       clientName: expense.label,
       label: expense.label,
       dueDate: expense.due_date,
-      total: Math.max(0, Math.round((expense.amount - paidAmount) * 100) / 100),
+      total: paidAmount === null ? null : Math.max(0, Math.round((expense.amount - paidAmount) * 100) / 100),
       grossTotal: expense.amount,
       currency: expense.currency,
       status: expense.status,
@@ -220,11 +312,14 @@ export default async function DueDatesPage() {
     };
   });
   const linkedExpensePayments = new Map<string, number>();
-  for (const expense of parsedExpenses.data) {
+  const linkedInvoiceIds = new Set<string>();
+  for (const expense of expenseRows) {
     if (!expense.invoice_id) continue;
+    linkedInvoiceIds.add(expense.invoice_id);
     const paidAmount = expense.status === "paid"
       ? expense.amount
-      : paidByExpense.get(expense.id) ?? 0;
+      : expensePaymentsAvailable ? paidByExpense.get(expense.id) ?? 0 : null;
+    if (paidAmount === null) continue;
     linkedExpensePayments.set(
       expense.invoice_id,
       Math.round(((linkedExpensePayments.get(expense.invoice_id) ?? 0) + paidAmount) * 100) / 100,
@@ -235,7 +330,15 @@ export default async function DueDatesPage() {
     grossTotal: invoice.total,
     paidAmount: invoice.status === "paid"
       ? invoice.total ?? 0
-      : linkedExpensePayments.get(invoice.id) ?? 0,
+      : invoice.invoiceType === "customer"
+        ? customerPaymentSchemaUnavailable || customerPaymentDataAvailable
+          ? paidByInvoice.get(invoice.id) ?? 0
+          : null
+        : invoice.invoiceType === "supplier" || invoice.supplierId
+          ? !expenseRowsAvailable || linkedInvoiceIds.has(invoice.id) && !expensePaymentsAvailable
+            ? linkedExpensePayments.get(invoice.id) ?? null
+            : linkedExpensePayments.get(invoice.id) ?? 0
+          : 0,
   }));
   const customerIds = [...new Set(invoicesWithPayments.flatMap(({ customerId }) => customerId ? [customerId] : []))];
   const supplierIds = [...new Set([...invoicesWithPayments, ...expenseItems].flatMap(({ supplierId }) => supplierId ? [supplierId] : []))];
@@ -244,7 +347,10 @@ export default async function DueDatesPage() {
     supplierIds.length ? supabase.from("suppliers").select("id, name").in("id", supplierIds) : null,
   ]);
   const counterpartyNames: Record<string, string> = {};
-  let partialDataWarning: string | null = expenseDataWarning;
+  let partialDataWarning: string | null = [
+    expenseDataWarning,
+    sourceDocumentWarning,
+  ].filter(Boolean).join(" ");
   for (const [label, result] of [["client", customers], ["fournisseur", suppliers]] as const) {
     if (!result) continue;
     const parsed = result.error ? null : contactNamesSchema.safeParse(result.data);
@@ -258,6 +364,10 @@ export default async function DueDatesPage() {
   }
   if (!personalResult.hasPartyLinks || !companyHasPartyLinks) {
     partialDataWarning = [partialDataWarning, "Les liens Clients/Fournisseurs ne sont pas disponibles dans le schéma chargé."]
+      .filter(Boolean).join(" ");
+  }
+  if (!personalResult.hasInvoiceType || !companyHasInvoiceType) {
+    partialDataWarning = [partialDataWarning, "Le sens de certaines factures reste à préciser. Appliquez la migration 017 pour enregistrer le type sans déduire celui des anciennes factures ambiguës."]
       .filter(Boolean).join(" ");
   }
   const unusableCurrencies = new Set([...invoicesWithPayments, ...expenseItems]

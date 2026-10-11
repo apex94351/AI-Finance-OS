@@ -19,6 +19,7 @@ import DocumentsPage from "@/app/documents/page";
 
 const companyId = "123e4567-e89b-42d3-a456-426614174000";
 const documentId = "123e4567-e89b-42d3-a456-426614174001";
+const userId = "123e4567-e89b-42d3-a456-426614174099";
 
 function query(result: { data: unknown; error: unknown }) {
   const builder: Record<string, unknown> = {};
@@ -35,7 +36,7 @@ describe("documents page schema compatibility", () => {
     vi.clearAllMocks();
     getAuthenticatedSupabase.mockResolvedValue({
       supabase: { from },
-      user: { id: "123e4567-e89b-42d3-a456-426614174099" },
+      user: { id: userId },
     });
   });
 
@@ -86,5 +87,49 @@ describe("documents page schema compatibility", () => {
     expect(manager.props.documents).toEqual([]);
     expect(manager.props.loadError).toContain("table public.documents n’est pas disponible");
     expect(manager.props.loadError).toContain("010_documents_storage.sql");
+  });
+
+  it("loads a personal document's invoice relation only within the same user scope", async () => {
+    const customerId = "123e4567-e89b-42d3-a456-426614174002";
+    const invoiceId = "123e4567-e89b-42d3-a456-426614174003";
+    const personalDocument = {
+      id: documentId,
+      user_id: userId,
+      company_id: null,
+      file_path: `${userId}/personal/invoice.pdf`,
+      file_name: "invoice.pdf",
+      file_type: "application/pdf",
+      file_size: 1024,
+      uploaded_at: "2026-10-01T10:00:00Z",
+      deleted_at: null,
+      category: "customer_invoice",
+      document_status: "validated",
+    };
+    const queues: Record<string, ReturnType<typeof query>[]> = {
+      company_members: [query({ data: [], error: null })],
+      documents: [query({ data: [personalDocument], error: null })],
+      invoices: [query({ data: [{
+        id: invoiceId,
+        user_id: userId,
+        company_id: null,
+        document_id: documentId,
+        invoice_number: "CLI-42",
+        customer_id: customerId,
+        supplier_id: null,
+      }], error: null })],
+      customers: [query({ data: [{ id: customerId, user_id: userId, company_id: null, name: "Client test" }], error: null })],
+      suppliers: [query({ data: [], error: null })],
+    };
+    from.mockImplementation((table: string) => queues[table]?.shift());
+
+    const page = await DocumentsPage() as ReactElement<{ children: ReactElement<{ documents: Array<{ relatedInvoices: unknown[] }>; loadError: string | null }> }>;
+    const manager = page.props.children;
+
+    expect(manager.props.loadError).toBeNull();
+    expect(manager.props.documents[0]?.relatedInvoices).toEqual([expect.objectContaining({
+      id: invoiceId,
+      invoiceNumber: "CLI-42",
+      customerName: "Client test",
+    })]);
   });
 });

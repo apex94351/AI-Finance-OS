@@ -14,7 +14,13 @@ vi.mock("@/database/components/app-shell", () => ({
   AppShell: ({ children }: { children: React.ReactNode }) => <main>{children}</main>,
 }));
 vi.mock("@/database/components/invoices/invoice-manager", () => ({
-  InvoiceManager: ({ loadError }: { loadError: string | null }) => <p>{loadError}</p>,
+  InvoiceManager: ({ loadError, invoices, contactWarning }: { loadError: string | null; invoices: unknown[]; contactWarning?: string | null }) => (
+    <section data-testid="invoice-manager" data-invoice-type={(invoices[0] as { invoiceType?: string } | undefined)?.invoiceType}>
+      <p>{loadError ?? `${invoices.length} facture(s) chargée(s)`}</p>
+      {contactWarning ? <p data-testid="invoice-warning">{contactWarning}</p> : null}
+      <pre>{JSON.stringify(invoices)}</pre>
+    </section>
+  ),
 }));
 
 import InvoicesPage from "@/app/invoices/page";
@@ -118,5 +124,65 @@ describe("invoice page query diagnostics", () => {
       },
     });
     serverError.mockRestore();
+  });
+
+  it("keeps existing invoices visible when invoice_type and invoice_payments are absent", async () => {
+    const userId = "123e4567-e89b-42d3-a456-426614174099";
+    const invoiceId = "123e4567-e89b-42d3-a456-426614174010";
+    const sourceDocumentId = "123e4567-e89b-42d3-a456-426614174011";
+    const legacyInvoice = {
+      id: invoiceId,
+      user_id: userId,
+      company_id: null,
+      customer_id: null,
+      supplier_id: null,
+      document_id: sourceDocumentId,
+      invoice_number: "FAC-EXISTANTE",
+      client_name: "Client libre",
+      description: "Prestation",
+      issue_date: "2026-10-01",
+      due_date: "2026-10-30",
+      subtotal_ht: 100,
+      vat_rate: 20,
+      vat_amount: 20,
+      total_ttc: 120,
+      currency: "EUR",
+      status: "pending",
+      category: null,
+      ai_summary: null,
+      created_at: "2026-10-01T00:00:00Z",
+      updated_at: "2026-10-01T00:00:00Z",
+    };
+    const missingType = Object.assign(new Error("column invoice_type does not exist"), { code: "42703" });
+    const missingPayments = Object.assign(new Error("table invoice_payments does not exist"), { code: "PGRST205" });
+    const queues: Record<string, ReturnType<typeof query>[]> = {
+      company_members: [query({ data: [], error: null })],
+      customers: [query({ data: [], error: null })],
+      suppliers: [query({ data: [], error: null })],
+      invoices: [
+        query({ data: null, error: null }),
+        query({ data: null, error: missingType }),
+        query({ data: [legacyInvoice], error: null }),
+      ],
+      documents: [query({ data: [{
+        id: sourceDocumentId,
+        user_id: userId,
+        company_id: null,
+        category: "customer_invoice",
+      }], error: null })],
+      invoice_payments: [query({ data: null, error: missingPayments })],
+      expenses: [query({ data: [], error: null })],
+    };
+    from.mockImplementation((table: string) => queues[table]?.shift() ?? query({ data: [], error: null }));
+
+    const page = await InvoicesPage();
+    const markup = renderToStaticMarkup(page);
+
+    expect(markup).toContain("1 facture(s) chargée(s)");
+    expect(markup).toContain('data-invoice-type="customer"');
+    expect(markup).toContain("&quot;total&quot;:120");
+    expect(markup).toContain("&quot;remainingAmount&quot;:120");
+    expect(markup).toContain("La migration 017 n’est pas installée");
+    expect(markup).not.toContain("Impossible de charger les factures");
   });
 });

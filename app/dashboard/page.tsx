@@ -3,7 +3,7 @@ import { DashboardClient } from "@/database/components/dashboard/dashboard-clien
 import { AppShell } from "@/database/components/app-shell";
 import { getAuthenticatedSupabase } from "@/lib/supabase/server";
 import { expenseRowSchema } from "@/services/expenses";
-import { getEffectiveInvoiceStatus } from "@/services/invoice-validation";
+import { getEffectiveInvoiceStatus, getInvoiceDirection, getInvoiceRemainingAmount, getVerifiedInvoiceSourceDocumentCategory } from "@/services/invoice-validation";
 import type { InvoiceRecord } from "@/types/invoice";
 
 const membershipSchema = z.array(z.object({ company_id: z.uuid() }));
@@ -16,6 +16,8 @@ const invoiceSchema = z.array(z.object({
   id: z.uuid(),
   user_id: z.uuid().nullable(),
   company_id: z.uuid().nullable(),
+  invoice_type: z.enum(["customer", "supplier"]).nullable().optional(),
+  document_id: z.uuid().nullable().optional(),
   customer_id: z.uuid().nullable().optional(),
   supplier_id: z.uuid().nullable().optional(),
   invoice_number: z.string().nullable(),
@@ -32,8 +34,15 @@ const invoiceSchema = z.array(z.object({
   updated_at: z.string(),
 }));
 
-const invoiceColumns = "id, user_id, company_id, invoice_number, client_name, description, issue_date, due_date, subtotal_ht, vat_amount, total_ttc, currency, status, created_at, updated_at";
-const invoiceColumnsWithParties = `${invoiceColumns}, customer_id, supplier_id`;
+const invoiceColumns = "id, user_id, company_id, document_id, invoice_number, client_name, description, issue_date, due_date, subtotal_ht, vat_amount, total_ttc, currency, status, created_at, updated_at";
+const invoiceColumnsWithParties = `${invoiceColumns}, customer_id, supplier_id, invoice_type`;
+const invoiceColumnsPartyOnly = `${invoiceColumns}, customer_id, supplier_id`;
+const sourceDocumentRowsSchema = z.array(z.object({
+  id: z.uuid(),
+  user_id: z.uuid().nullable(),
+  company_id: z.uuid().nullable(),
+  category: z.string(),
+}));
 const contactNamesSchema = z.array(z.object({ id: z.uuid(), name: z.string() }));
 const dashboardExpenseSchema = expenseRowSchema.pick({
   id: true,
@@ -67,29 +76,40 @@ async function queryInvoices(
 
   const result = await select(invoiceColumnsWithParties);
   if (!result.error) {
-    return { data: result.data as unknown[], error: null, hasPartyLinks: true };
+    return { data: result.data as unknown[], error: null, hasPartyLinks: true, hasInvoiceType: true };
   }
   if (!["42703", "PGRST204"].includes(result.error.code)) {
-    return { data: [] as unknown[], error: result.error, hasPartyLinks: false };
+    return { data: [] as unknown[], error: result.error, hasPartyLinks: false, hasInvoiceType: false };
   }
 
+  const partiesFallback = await select(invoiceColumnsPartyOnly);
+  if (!partiesFallback.error) {
+    return { data: partiesFallback.data as unknown[], error: null, hasPartyLinks: true, hasInvoiceType: false };
+  }
   const fallback = await select(invoiceColumns);
   return {
     data: (fallback.data ?? []) as unknown[],
     error: fallback.error,
     hasPartyLinks: false,
+    hasInvoiceType: false,
   };
 }
 
-function mapInvoice(invoice: z.infer<typeof invoiceSchema>[number], asOfDate: string): InvoiceRecord {
+function mapInvoice(
+  invoice: z.infer<typeof invoiceSchema>[number],
+  asOfDate: string,
+  sourceDocumentCategory: "customer_invoice" | "supplier_invoice" | null = null,
+): InvoiceRecord {
   const status = getEffectiveInvoiceStatus(invoice.status, invoice.due_date, new Date(`${asOfDate}T00:00:00Z`));
   return {
     id: invoice.id,
     userId: invoice.user_id,
     companyId: invoice.company_id,
+    invoiceType: invoice.invoice_type ?? null,
+    sourceDocumentCategory,
     customerId: invoice.customer_id ?? null,
     supplierId: invoice.supplier_id ?? null,
-    documentId: null,
+    documentId: invoice.document_id ?? null,
     invoiceNumber: invoice.invoice_number,
     clientName: invoice.client_name,
     description: invoice.description,
@@ -154,6 +174,7 @@ export default async function DashboardPage() {
 
   let companyRows: unknown[] = [];
   let companyRowsHavePartyLinks = true;
+  let companyRowsHaveInvoiceType = true;
   if (companyIds.length > 0) {
     const companyResult = await queryInvoices(supabase, user.id, companyIds);
     if (companyResult.error) {
@@ -162,6 +183,7 @@ export default async function DashboardPage() {
     }
     companyRows = companyResult.data;
     companyRowsHavePartyLinks = companyResult.hasPartyLinks;
+    companyRowsHaveInvoiceType = companyResult.hasInvoiceType;
   }
 
   const parsedInvoices = invoiceSchema.safeParse([...personalResult.data, ...companyRows]);
@@ -170,9 +192,38 @@ export default async function DashboardPage() {
     return <AppShell pageTitle="home"><DashboardClient invoices={[]} loadError="Les factures reçues ne sont pas au format attendu." asOfDate={asOfDate} /></AppShell>;
   }
 
+  const documentIds = [...new Set(parsedInvoices.data.flatMap(({ document_id }) => document_id ? [document_id] : []))];
+  const sourceCategoryByInvoice = new Map<string, "customer_invoice" | "supplier_invoice">();
+  let sourceDocumentWarning: string | null = null;
+  if (documentIds.length) {
+    const documentResult = await supabase.from("documents").select("id, user_id, company_id, category").in("id", documentIds);
+    const documents = sourceDocumentRowsSchema.safeParse(documentResult.data ?? []);
+    if (documentResult.error || !documents.success) {
+      console.error("Dashboard invoice document category query failed", { code: documentResult.error?.code ?? "INVALID_RESULT" });
+      sourceDocumentWarning = "Les catégories des documents sources sont momentanément indisponibles.";
+    } else {
+      for (const invoice of parsedInvoices.data) {
+        if (!invoice.document_id) continue;
+        const document = documents.data.find(({ id }) => id === invoice.document_id);
+        if (!document) continue;
+        const category = getVerifiedInvoiceSourceDocumentCategory({
+          documentId: invoice.document_id,
+          userId: invoice.user_id,
+          companyId: invoice.company_id,
+        }, {
+          id: document.id,
+          userId: document.user_id,
+          companyId: document.company_id,
+          category: document.category,
+        });
+        if (category) sourceCategoryByInvoice.set(invoice.id, category);
+      }
+    }
+  }
+
   const companyCurrency = new Map(companies.data.map(({ id, currency }) => [id, currency]));
-  const invoices = parsedInvoices.data.map((row) => {
-    const invoice = mapInvoice(row, asOfDate);
+  let invoices: InvoiceRecord[] = parsedInvoices.data.map((row) => {
+    const invoice = mapInvoice(row, asOfDate, sourceCategoryByInvoice.get(row.id) ?? null);
     return {
       ...invoice,
       partyLinksAvailable: invoice.companyId ? companyRowsHavePartyLinks : personalResult.hasPartyLinks,
@@ -186,7 +237,7 @@ export default async function DashboardPage() {
     linkedSupplierIds.length ? supabase.from("suppliers").select("id, name").in("id", linkedSupplierIds) : null,
   ]);
   const counterpartyNames: Record<string, string> = {};
-  let partialDataWarning: string | null = null;
+  let partialDataWarning: string | null = sourceDocumentWarning;
   for (const [kind, result] of [["client", customers], ["fournisseur", suppliers]] as const) {
     if (!result) continue;
     if (result.error) {
@@ -205,6 +256,81 @@ export default async function DashboardPage() {
   if (!companyRowsHavePartyLinks || !personalResult.hasPartyLinks) {
     partialDataWarning = "Les associations Clients/Fournisseurs ne sont pas disponibles dans le schéma chargé.";
   }
+
+  const invoiceIds = invoices.map(({ id }) => id);
+  const customerPaymentsResult = invoiceIds.length
+    ? await supabase.from("invoice_payments").select("invoice_id, amount").in("invoice_id", invoiceIds)
+    : { data: [], error: null };
+  const paymentLedgerUnavailable = Boolean(customerPaymentsResult.error
+    && ["42P01", "42703", "PGRST202", "PGRST204", "PGRST205"].includes(customerPaymentsResult.error.code ?? ""));
+  if (customerPaymentsResult.error && !paymentLedgerUnavailable) {
+    console.error("Dashboard invoice payment query failed", { code: customerPaymentsResult.error.code });
+    partialDataWarning = [partialDataWarning, "Les paiements des factures sont momentanément indisponibles."]
+      .filter(Boolean).join(" ");
+  }
+  if (paymentLedgerUnavailable || !personalResult.hasInvoiceType || !companyRowsHaveInvoiceType) {
+    partialDataWarning = [partialDataWarning, "Appliquez la migration 017 pour charger les paiements partiels et le sens explicite des factures."]
+      .filter(Boolean).join(" ");
+  }
+  const customerPaymentsAvailable = !customerPaymentsResult.error;
+  const paidByInvoice = new Map<string, number>();
+  for (const payment of customerPaymentsResult.error ? [] : customerPaymentsResult.data ?? []) {
+    const row = payment as { invoice_id: string; amount: number | string };
+    const amount = typeof row.amount === "number" ? row.amount : Number(row.amount);
+    if (!Number.isFinite(amount)) continue;
+    paidByInvoice.set(row.invoice_id, Math.round(((paidByInvoice.get(row.invoice_id) ?? 0) + amount) * 100) / 100);
+  }
+
+  const supplierInvoiceIds = invoices.flatMap((invoice) => (
+    getInvoiceDirection(invoice) === "supplier" ? [invoice.id] : []
+  ));
+  const linkedExpensesResult = supplierInvoiceIds.length
+    ? await supabase.from("expenses").select("id, invoice_id, status").in("invoice_id", supplierInvoiceIds)
+    : { data: [], error: null };
+  const paidBySupplierInvoice = new Map<string, number>();
+  let supplierPaymentsAvailable = !linkedExpensesResult.error;
+  if (linkedExpensesResult.error) {
+    console.error("Dashboard supplier invoice expense query failed", { code: linkedExpensesResult.error.code });
+    partialDataWarning = [partialDataWarning, "Les paiements fournisseurs liés aux dépenses ne sont pas disponibles."]
+      .filter(Boolean).join(" ");
+  } else if (linkedExpensesResult.data?.length) {
+    const linkedExpenses = linkedExpensesResult.data as { id: string; invoice_id: string; status: string }[];
+    const expenseIds = linkedExpenses.map(({ id }) => id);
+    const supplierPaymentsResult = await supabase.from("expense_payments").select("expense_id, amount").in("expense_id", expenseIds);
+    const paidByExpense = new Map<string, number>();
+    if (supplierPaymentsResult.error) {
+      supplierPaymentsAvailable = false;
+      console.error("Dashboard supplier payment query failed", { code: supplierPaymentsResult.error.code });
+      partialDataWarning = [partialDataWarning, "L’historique des paiements fournisseurs est indisponible."]
+        .filter(Boolean).join(" ");
+    } else {
+      for (const payment of supplierPaymentsResult.data ?? []) {
+        const row = payment as { expense_id: string; amount: number | string };
+        const amount = typeof row.amount === "number" ? row.amount : Number(row.amount);
+        if (!Number.isFinite(amount)) continue;
+        paidByExpense.set(row.expense_id, Math.round(((paidByExpense.get(row.expense_id) ?? 0) + amount) * 100) / 100);
+      }
+    }
+    for (const expense of linkedExpenses) {
+      const invoiceTotal = invoices.find(({ id }) => id === expense.invoice_id)?.total ?? 0;
+      const amount = expense.status === "paid" ? invoiceTotal : paidByExpense.get(expense.id) ?? 0;
+      paidBySupplierInvoice.set(expense.invoice_id, Math.round(((paidBySupplierInvoice.get(expense.invoice_id) ?? 0) + amount) * 100) / 100);
+    }
+  }
+  invoices = invoices.map((invoice) => {
+    const paidAmount = invoice.status === "paid"
+      ? invoice.total ?? 0
+      : getInvoiceDirection(invoice) === "customer"
+        ? customerPaymentsAvailable || paymentLedgerUnavailable ? paidByInvoice.get(invoice.id) ?? 0 : null
+        : getInvoiceDirection(invoice) === "supplier"
+          ? supplierPaymentsAvailable ? paidBySupplierInvoice.get(invoice.id) ?? 0 : null
+          : 0;
+    return {
+      ...invoice,
+      paidAmount,
+      remainingAmount: getInvoiceRemainingAmount(invoice.total, paidAmount, invoice.status),
+    };
+  });
 
   const personalExpenseResult = await supabase.from("expenses")
     .select(expenseColumns)

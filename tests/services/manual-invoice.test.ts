@@ -8,6 +8,7 @@ import {
 const validInvoice = {
   invoiceNumber: "",
   clientName: "Client",
+  invoiceType: "customer" as const,
   description: "Mission de conseil",
   subtotal: "100.00",
   vatRate: "20",
@@ -27,12 +28,16 @@ describe("manual invoice validation and calculations", () => {
     expect(calculateInvoiceAmounts("0,05", "10")?.vatAmount).toBe(0.01);
   });
 
-  it("accepts the three user-facing payment statuses and requires an invoice number", () => {
+  it("accepts persisted payment states and requires an explicit invoice direction", () => {
     expect(manualInvoiceSchema.safeParse({ ...validInvoice, vatRate: "101" }).success).toBe(false);
     expect(manualInvoiceSchema.safeParse({ ...validInvoice, invoiceNumber: "" }).success).toBe(false);
     expect(manualInvoiceSchema.safeParse({ ...validInvoice, invoiceNumber: "FAC-1" }).success).toBe(true);
     expect(manualInvoiceSchema.safeParse({ ...validInvoice, invoiceNumber: "FAC-1", status: "overdue" }).success).toBe(true);
     expect(manualInvoiceSchema.safeParse({ ...validInvoice, status: "receivable" }).success).toBe(false);
+    expect(manualInvoiceSchema.safeParse({ ...validInvoice, invoiceNumber: "FAC-1", invoiceType: "supplier" }).success).toBe(true);
+    const { invoiceType, ...invoiceWithoutDirection } = validInvoice;
+    expect(invoiceType).toBe("customer");
+    expect(manualInvoiceSchema.safeParse(invoiceWithoutDirection).success).toBe(false);
   });
 
   it("rejects due dates preceding the issue date", () => {
@@ -46,7 +51,7 @@ describe("manual invoice validation and calculations", () => {
     expect(getPersistedInvoiceStatus("pending", "2026-10-09", currentDate)).toBe("overdue");
     expect(getPersistedInvoiceStatus("pending", "2026-10-10", currentDate)).toBe("pending");
     expect(getPersistedInvoiceStatus("paid", "2026-10-09", currentDate)).toBe("paid");
-    expect(getPersistedInvoiceStatus("overdue", "2026-10-11", currentDate)).toBe("overdue");
+    expect(getPersistedInvoiceStatus("overdue", "2026-10-11", currentDate)).toBeNull();
     expect(getPersistedInvoiceStatus("overdue", "2026-10-09", currentDate)).toBe("overdue");
     expect(getPersistedInvoiceStatus("receivable", null, currentDate)).toBe("pending");
     expect(getPersistedInvoiceStatus("paid", "2026-10-11", currentDate)).toBe("paid");

@@ -462,11 +462,13 @@ export function DocumentManager({
                             <h3>Relations disponibles</h3>
                             {document.relatedInvoices.length ? document.relatedInvoices.map((invoice) => (
                               <p key={invoice.id}>
+                                <Link className="text-button" href={`/invoices#invoice-${invoice.id}`}>
                                 Facture liée{invoice.invoiceNumber ? ` n° ${invoice.invoiceNumber}` : ` (${invoice.id})`}
                                 {invoice.customerName ? ` · Client : ${invoice.customerName}` : ""}
                                 {invoice.supplierName ? ` · Fournisseur : ${invoice.supplierName}` : ""}
                                 {invoice.customerId && !invoice.customerName ? ` · Client lié (${invoice.customerId})` : ""}
                                 {invoice.supplierId && !invoice.supplierName ? ` · Fournisseur lié (${invoice.supplierId})` : ""}
+                                </Link>
                               </p>
                             )) : <p>Aucune facture directement liée.</p>}
                             <p>Le schéma actuel ne définit pas de relation directe entre document et dépense ou devis.</p>

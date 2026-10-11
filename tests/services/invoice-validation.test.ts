@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ExtractedField, ExtractedInvoiceLine, ExtractedParty, InvoiceAnalysisResult } from "@/lib/ai/types";
-import { deriveInvoiceStatus, getEffectiveInvoiceStatus, validateInvoiceAnalysis } from "@/services/invoice-validation";
+import { deriveInvoiceStatus, getEffectiveInvoiceStatus, getInvoiceDirection, getInvoiceDisplayStatus, getInvoiceRemainingAmount, getVerifiedInvoiceSourceDocumentCategory, validateInvoiceAnalysis } from "@/services/invoice-validation";
 
 function field<T>(value: T | null = null, status: ExtractedField<T>["status"] = value === null ? "missing" : "present"): ExtractedField<T> {
   return { status, value };
@@ -250,11 +250,75 @@ describe("invoice extraction financial validation", () => {
     expect(deriveInvoiceStatus("2026-02-30", new Date("2026-03-02T00:00:00Z"))).toBe("pending");
   });
 
-  it("keeps paid and manually overdue invoices while recalculating legacy unpaid statuses", () => {
+  it("keeps paid invoices and derives unpaid overdue status only from the due date", () => {
     const today = new Date("2026-01-02T12:00:00Z");
     expect(getEffectiveInvoiceStatus("paid", "2025-01-01", today)).toBe("paid");
     expect(getEffectiveInvoiceStatus("receivable", "2026-01-01", today)).toBe("overdue");
-    expect(getEffectiveInvoiceStatus("overdue", "2026-01-03", today)).toBe("overdue");
+    expect(getEffectiveInvoiceStatus("overdue", "2026-01-03", today)).toBe("pending");
     expect(getEffectiveInvoiceStatus("pending", null, today)).toBe("pending");
+  });
+
+  it("shows unpaid and partial client statuses from confirmed direction and recorded payments", () => {
+    const today = new Date("2026-01-02T12:00:00Z");
+    const clientInvoice = {
+      invoiceType: "customer" as const,
+      customerId: null,
+      supplierId: null,
+      status: "pending" as const,
+      dueDate: "2026-01-03",
+      total: 100,
+      paidAmount: 0,
+    };
+
+    expect(getInvoiceDisplayStatus(clientInvoice, today)).toBe("unpaid");
+    expect(getInvoiceDisplayStatus({ ...clientInvoice, paidAmount: 25 }, today)).toBe("partially_paid");
+    expect(getInvoiceRemainingAmount(100, 25, "pending")).toBe(75);
+    expect(getInvoiceDisplayStatus({ ...clientInvoice, dueDate: "2026-01-01", paidAmount: 25 }, today)).toBe("overdue");
+    expect(getInvoiceDisplayStatus({ ...clientInvoice, paidAmount: 100 }, today)).toBe("paid");
+    expect(getInvoiceDisplayStatus({ ...clientInvoice, status: "cancelled" }, today)).toBe("cancelled");
+  });
+
+  it("does not guess the direction of a legacy invoice or conceal an overpayment", () => {
+    const today = new Date("2026-01-02T12:00:00Z");
+    const ambiguous = {
+      invoiceType: null,
+      customerId: null,
+      supplierId: null,
+      status: "pending" as const,
+      dueDate: "2026-01-03",
+      total: 100,
+      paidAmount: 0,
+    };
+
+    expect(getInvoiceDisplayStatus(ambiguous, today)).toBe("unclassified");
+    expect(getInvoiceRemainingAmount(100, 101, "pending")).toBeNull();
+  });
+
+  it("uses an explicitly verified source document category when invoice_type is unavailable", () => {
+    expect(getInvoiceDirection({
+      invoiceType: null,
+      customerId: null,
+      supplierId: null,
+      sourceDocumentCategory: "customer_invoice",
+    })).toBe("customer");
+    expect(getInvoiceDirection({
+      invoiceType: null,
+      customerId: null,
+      supplierId: null,
+      sourceDocumentCategory: "supplier_invoice",
+    })).toBe("supplier");
+  });
+
+  it("rejects a source document category from a different document or owner", () => {
+    const invoice = { documentId: "doc-1", userId: "user-1", companyId: null };
+    expect(getVerifiedInvoiceSourceDocumentCategory(invoice, {
+      id: "doc-1", userId: "user-1", companyId: null, category: "customer_invoice",
+    })).toBe("customer_invoice");
+    expect(getVerifiedInvoiceSourceDocumentCategory(invoice, {
+      id: "doc-1", userId: "user-2", companyId: null, category: "customer_invoice",
+    })).toBeNull();
+    expect(getVerifiedInvoiceSourceDocumentCategory(invoice, {
+      id: "doc-1", userId: "user-1", companyId: null, category: "other",
+    })).toBeNull();
   });
 });

@@ -21,8 +21,9 @@ import {
   type DashboardChartInterval,
   type DashboardPeriod,
 } from "@/services/dashboard";
+import { getInvoiceDirection, getInvoiceDisplayStatus, getInvoiceRemainingAmount } from "@/services/invoice-validation";
 import type { ExpenseRecord } from "@/services/expenses";
-import type { InvoiceCompany, InvoiceRecord, InvoiceStatus } from "@/types/invoice";
+import type { InvoiceCompany, InvoiceRecord } from "@/types/invoice";
 
 interface DashboardClientProps {
   invoices: InvoiceRecord[];
@@ -119,10 +120,15 @@ function counterpartyLabel(invoice: InvoiceRecord, names: Record<string, string>
   return invoice.clientName || "Tiers non renseigné";
 }
 
-function statusLabel(status: InvoiceStatus) {
+function statusLabel(invoice: InvoiceRecord) {
+  const status = getInvoiceDisplayStatus(invoice);
   switch (status) {
     case "draft": return "Brouillon";
-    case "pending": return "À payer";
+    case "pending": return getInvoiceDirection(invoice) === "customer" ? "Impayée" : "À payer";
+    case "unpaid": return "Impayée";
+    case "partially_paid": return "Partiellement payée";
+    case "unclassified": return "Type à préciser";
+    case "payment_inconsistent": return "Paiement à vérifier";
     case "paid": return "Payée";
     case "overdue": return "En retard";
     case "receivable": return "À encaisser";
@@ -130,9 +136,10 @@ function statusLabel(status: InvoiceStatus) {
   }
 }
 
-function statusTone(status: InvoiceStatus): "neutral" | "success" | "warning" | "danger" {
+function statusTone(invoice: InvoiceRecord): "neutral" | "success" | "warning" | "danger" {
+  const status = getInvoiceDisplayStatus(invoice);
   if (status === "paid" || status === "receivable") return "success";
-  if (status === "overdue") return "danger";
+  if (status === "overdue" || status === "payment_inconsistent") return "danger";
   if (status === "pending") return "warning";
   return "neutral";
 }
@@ -140,9 +147,10 @@ function statusTone(status: InvoiceStatus): "neutral" | "success" | "warning" | 
 function invoiceTotals(invoices: InvoiceRecord[]) {
   const totals = new Map<string, number>();
   for (const invoice of invoices) {
+    const remaining = invoice.remainingAmount ?? getInvoiceRemainingAmount(invoice.total, invoice.paidAmount, invoice.status);
     if (!invoice.currency || !/^[A-Z]{3}$/.test(invoice.currency)
-      || invoice.total === null || !Number.isFinite(invoice.total) || invoice.total <= 0) continue;
-    totals.set(invoice.currency, (totals.get(invoice.currency) ?? 0) + Math.round(invoice.total * 100));
+      || remaining === null || remaining === undefined || !Number.isFinite(remaining) || remaining <= 0) continue;
+    totals.set(invoice.currency, (totals.get(invoice.currency) ?? 0) + Math.round(remaining * 100));
   }
   return formatTotals([...totals].map(([currency, cents]) => ({ currency, amount: cents / 100 })));
 }
@@ -339,7 +347,7 @@ export function DashboardClient({
                     invoice={invoice}
                     names={counterpartyNames}
                     asOfDate={asOfDate}
-                    direction={invoice.supplierId ? "Paiement à effectuer" : invoice.customerId || partyLinksAvailable ? "Encaissement attendu" : "Direction à confirmer"}
+                    direction={getInvoiceDirection(invoice) === "supplier" ? "Paiement à effectuer" : getInvoiceDirection(invoice) === "customer" ? "Encaissement attendu" : "Direction à confirmer"}
                   />
                 ))}
               </div>
@@ -357,7 +365,7 @@ export function DashboardClient({
                     invoice={invoice}
                     names={counterpartyNames}
                     asOfDate={asOfDate}
-                    direction={invoice.supplierId ? "Paiement à effectuer" : invoice.customerId || partyLinksAvailable ? "Encaissement attendu" : "Direction à confirmer"}
+                    direction={getInvoiceDirection(invoice) === "supplier" ? "Paiement à effectuer" : getInvoiceDirection(invoice) === "customer" ? "Encaissement attendu" : "Direction à confirmer"}
                   />
                 ))}
               </div>
@@ -390,7 +398,7 @@ function InvoiceDueLink({
       </span>
       <span className="dashboard-upcoming-value">
         <strong>{invoice.total === null || !invoice.currency ? "Montant à vérifier" : currencyFormat(invoice.total, invoice.currency)}</strong>
-        <Badge tone={statusTone(invoice.status)}>{statusLabel(invoice.status)}</Badge>
+                    <Badge tone={statusTone(invoice)}>{statusLabel(invoice)}</Badge>
       </span>
     </Link>
   );

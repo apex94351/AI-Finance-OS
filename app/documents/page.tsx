@@ -13,6 +13,15 @@ const membershipSchema = z.array(z.object({ company_id: z.uuid() }));
 const documentBaseColumns = "id, company_id, file_path, file_name, file_type, file_size, uploaded_at, deleted_at";
 const documentRegistryColumns = `${documentBaseColumns}, category, document_status`;
 const personalDocumentColumns = `id, user_id, company_id, file_path, file_name, file_type, file_size, uploaded_at, deleted_at, category, document_status`;
+const personalDocumentInvoiceSchema = z.object({
+  id: z.uuid(),
+  user_id: z.uuid(),
+  company_id: z.null(),
+  document_id: z.uuid(),
+  invoice_number: z.string().nullable(),
+  customer_id: z.uuid().nullable(),
+  supplier_id: z.uuid().nullable(),
+});
 
 type DocumentQueryError = {
   code?: string;
@@ -240,6 +249,68 @@ export default async function DocumentsPage() {
             supplierId: invoice.supplier_id,
           });
           relationsByDocument.set(invoice.document_id, current);
+        }
+      }
+    }
+  }
+
+  const personalDocuments = documents.filter((document) => document.user_id !== null && document.company_id === null);
+  if (personalDocuments.length) {
+    const personalInvoiceResult = await supabase.from("invoices")
+      .select("id, user_id, company_id, document_id, invoice_number, customer_id, supplier_id")
+      .eq("user_id", user.id)
+      .is("company_id", null)
+      .in("document_id", personalDocuments.map(({ id }) => id));
+    if (personalInvoiceResult.error) {
+      console.error("Personal document invoice relation query failed", { code: personalInvoiceResult.error.code });
+      relationshipWarning = "Les relations des documents personnels avec les factures n’ont pas pu être chargées.";
+    } else {
+      const parsedPersonalInvoices = z.array(personalDocumentInvoiceSchema).safeParse(personalInvoiceResult.data);
+      if (!parsedPersonalInvoices.success) {
+        console.error("Personal document invoice relation query returned an unexpected result");
+        relationshipWarning = "Les relations de factures des documents personnels ne sont pas au format attendu.";
+      } else {
+        const personalContactIds = [...new Set(parsedPersonalInvoices.data.flatMap((invoice) => [
+          invoice.customer_id,
+          invoice.supplier_id,
+        ]).filter((id): id is string => Boolean(id)))];
+        const personalContactNames = new Map<string, string>();
+        for (const table of ["customers", "suppliers"] as const) {
+          if (!personalContactIds.length) continue;
+          const contactsResult = await supabase.from(table)
+            .select("id, user_id, company_id, name")
+            .eq("user_id", user.id)
+            .is("company_id", null)
+            .in("id", personalContactIds);
+          if (contactsResult.error) {
+            console.error("Personal document invoice contact query failed", { table, code: contactsResult.error.code });
+            relationshipWarning = "Certaines relations des documents personnels avec les clients ou fournisseurs ne sont pas disponibles.";
+            continue;
+          }
+          const parsedContacts = z.array(z.object({
+            id: z.uuid(),
+            user_id: z.uuid(),
+            company_id: z.null(),
+            name: z.string(),
+          })).safeParse(contactsResult.data);
+          if (!parsedContacts.success) {
+            relationshipWarning = "Les relations des documents personnels avec les tiers ne sont pas au format attendu.";
+            continue;
+          }
+          for (const contact of parsedContacts.data) personalContactNames.set(contact.id, contact.name);
+        }
+        for (const invoice of parsedPersonalInvoices.data) {
+          if (!personalDocuments.some(({ id }) => id === invoice.document_id)) continue;
+          const related = relationsByDocument.get(invoice.document_id) ?? [];
+          related.push({
+            id: invoice.id,
+            invoiceNumber: invoice.invoice_number,
+            customerName: invoice.customer_id ? personalContactNames.get(invoice.customer_id) ?? null : null,
+            supplierName: invoice.supplier_id ? personalContactNames.get(invoice.supplier_id) ?? null : null,
+            customerId: invoice.customer_id,
+            supplierId: invoice.supplier_id,
+          });
+          relationsByDocument.set(invoice.document_id, related);
         }
       }
     }
