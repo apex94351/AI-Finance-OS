@@ -254,7 +254,7 @@ describe("invoice extraction financial validation", () => {
     const today = new Date("2026-01-02T12:00:00Z");
     expect(getEffectiveInvoiceStatus("paid", "2025-01-01", today)).toBe("paid");
     expect(getEffectiveInvoiceStatus("receivable", "2026-01-01", today)).toBe("overdue");
-    expect(getEffectiveInvoiceStatus("overdue", "2026-01-03", today)).toBe("pending");
+    expect(getEffectiveInvoiceStatus("overdue", "2026-01-03", today)).toBe("overdue");
     expect(getEffectiveInvoiceStatus("pending", null, today)).toBe("pending");
   });
 

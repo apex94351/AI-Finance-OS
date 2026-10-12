@@ -324,8 +324,10 @@ pas dépendre du prochain passage du cron. Le cron ne déclenche aucun paiement.
 Le module Échéances reprend les dépenses avec échéance, en excluant les
 dépenses liées à une facture déjà listée. « Payé ce mois-ci » ne compte que les
 paiements portant une date réelle ; le schéma historique des factures ne
-fournit pas de date de règlement fiable et ces factures payées ne sont donc pas
-ajoutées à cet indicateur.
+fournit pas de date de règlement fiable; les anciens statuts « payée » sans
+historique daté ne sont donc pas attribués à un mois. Les paiements initiés
+depuis Factures doivent enregistrer une vraie date avec la migration 018
+ci-dessous.
 
 Avant toute application, inspectez les prérequis et les données dans le projet
 cible. N'appliquez pas 015 séparément : appliquez uniquement 016 comme décrit
@@ -365,6 +367,70 @@ AI CFO ne dispose pas encore de CRUD métier complet dans ce dépôt. Les
 fournisseurs utilisent leurs tables créées en migration 008. Ne rendez pas les
 nouvelles tables publiques et ajoutez des policies propres à chaque ligne.
 
+## Migration 018 : paiement daté des factures fournisseurs
+
+`018_record_supplier_invoice_payment.sql` réutilise `expenses` et
+`expense_payments`, sans nouvelle table de paiement. Elle exige les migrations
+008 et 016 (relations fournisseurs, lien unique de facture et RPC de paiement)
+et s’exécute après 017 si celle-ci est utilisée. La RPC vérifie l’utilisateur
+ou son rôle d’entreprise, verrouille la facture, refuse les factures non
+fournisseur/non associées à un fournisseur vérifié, et enregistre la date et le
+montant via `record_expense_payment`. Si aucune dépense n’est liée, elle crée
+dans la même transaction l’unique dépense représentant la facture; si une
+dépense existe, elle la réutilise après vérification du propriétaire, du
+fournisseur, du montant et de la devise. Un trigger maintient le statut de la
+facture à partir des paiements datés de cette dépense. La contrainte unique
+`expenses_invoice_unique_idx` empêche de matérialiser deux fois la même facture.
+
+Les paiements partiels sont pris en charge; « Payée » n’est persisté qu’après
+que le cumul des paiements couvre la facture. Le dashboard Dépenses lit
+`expense_payments.payment_date`, et ne suppose jamais que la date de facture ou
+d’échéance est celle du paiement. Les anciennes factures déjà au statut `paid`
+sans paiement daté ne sont pas rétro-datées ni ajoutées à un mois fictif.
+
+Avant application, vérifiez les prérequis 008/016, la présence des fonctions
+`can_write_company_invoice`, `can_write_company_contact` et
+`record_expense_payment`, puis inspectez les relations/factures liées sur une
+base de préproduction. Appliquez manuellement le contenu intégral de
+`018_record_supplier_invoice_payment.sql` dans le SQL Editor et vérifiez le
+résultat de chaque paiement de test (complet, partiel, dépassement, date future,
+facture avec/sans dépense liée et isolation RLS). Cette migration est locale et
+n’a pas été appliquée à une base distante.
+
+L’action de paiement vérifie également le RPC idempotent créé par la migration
+019 ci-dessous. Si Supabase répond `42883` ou `PGRST202`, cela signifie que le
+RPC attendu n’est pas exposé par le schéma distant (ou que son cache API est
+obsolète), et non que le fichier local 018 est absent. Aucun paiement n’est
+considéré comme enregistré dans ce cas.
+
+## Migration 019 : solde initial de trésorerie et reprises de paiement
+
+`019_treasury_opening_balance_and_supplier_payment_idempotency.sql` crée une
+ligne de solde initial par propriétaire et devise. L’isolation personnelle/
+entreprise utilise les colonnes `user_id`/`company_id` exclusives des autres
+tables métier, et des politiques RLS distinctes pour la lecture membre et
+l’écriture selon les droits d’entreprise déjà définis. La contrainte unique
+autorise une mise à jour atomique par propriétaire et devise.
+
+La migration ajoute aussi une clé de requête liée au paiement fournisseur.
+`record_supplier_invoice_payment_idempotent` verrouille la facture, vérifie
+l’accès et les détails de la clé, puis délègue la première écriture à la RPC
+existante de 018. Une nouvelle tentative avec la même clé et les mêmes détails
+renvoie le paiement enregistré sans créer une deuxième ligne; réutiliser la clé
+avec des données différentes est refusé. La table de requêtes ne donne aucun
+accès direct aux rôles client et reste consultée par la fonction sécurisée.
+
+Avant application, vérifiez dans la base cible les tables `invoices`,
+`expenses`, `expense_payments` et `companies`, les fonctions
+`record_supplier_invoice_payment`, `can_write_company_invoice` et
+`is_company_member`, ainsi que les versions PostgreSQL prenant en charge
+`UNIQUE NULLS NOT DISTINCT`. Appliquez d’abord 018 puis le fichier 019 complet
+dans le SQL Editor Supabase. Vérifiez les policies RLS et testez en préproduction
+le solde personnel et entreprise, le refus d’une écriture par un rôle non
+autorisé, un paiement fournisseur, sa répétition avec la même clé et son refus
+avec la même clé mais des détails différents. Cette migration est locale et
+n’a pas été appliquée à une base distante.
+
 ## Migration 017 : sens des factures et paiements clients
 
 `017_invoice_directions_and_customer_payments.sql` ajoute `invoices.invoice_type`
@@ -372,6 +438,15 @@ nouvelles tables publiques et ajoutez des policies propres à chaque ligne.
 encaissements clients. Elle doit être appliquée manuellement après vérification
 des migrations `007`, `008`, `010`, `011`, `013`, `015` et `016` sur la base cible. Elle ne change
 aucun statut existant et ne crée aucun faux paiement.
+
+La colonne `invoice_type` est nullable et sa contrainte autorise explicitement
+un type sans `customer_id` ni `supplier_id`. Après application de 017, une
+facture libre peut donc être qualifiée sans créer de tiers. Avant 017, le
+schéma 016 ne possède pas cette colonne : l’application peut confirmer la
+direction par un lien de tiers vérifié, mais doit refuser une sauvegarde de
+type libre. Le bouton « Enregistrer uniquement le sens » met à jour uniquement
+le type et les liens de tiers; il ne réécrit ni montant ni devise. Sur le
+schéma 016, son fallback ne sauvegarde un sens que par un lien de tiers vérifié.
 
 Le backfill classe les factures à partir de `customer_id` ou `supplier_id`
 explicitement renseigné, ou d’un document source dont la catégorie est
@@ -417,6 +492,17 @@ cliente sans paiement est « Impayée » avant échéance, devient « En retard 
 après échéance, puis « Partiellement payée » ou « Payée » à partir des paiements
 validés. Cette migration n’a pas été appliquée à une base distante et ne crée
 ni ne modifie de tâche planifiée.
+
+Pour l’appliquer manuellement, vérifiez d’abord dans le projet Supabase cible
+que les migrations prérequises listées ci-dessus sont installées, que les
+colonnes `customer_id`, `supplier_id`, `document_id` et `expenses.invoice_id`
+existent, et que les fonctions `can_write_company_invoice` et
+`is_company_member` sont présentes. Puis exécutez le contenu intégral et
+inchangé de `017_invoice_directions_and_customer_payments.sql` une seule fois
+dans le SQL Editor. Si le préflight échoue, arrêtez-vous et corrigez les
+prérequis; ne retirez pas les contrôles. Après application, exécutez les
+requêtes de vérification ci-dessus et testez l’isolation RLS avec des comptes
+de préproduction. Aucune étape distante n’a été exécutée pendant ce correctif.
 
 ## Ancienne RPC de création d'entreprise
 

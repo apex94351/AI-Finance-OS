@@ -2,6 +2,7 @@ import { z } from "zod";
 import { DashboardClient } from "@/database/components/dashboard/dashboard-client";
 import { AppShell } from "@/database/components/app-shell";
 import { getAuthenticatedSupabase } from "@/lib/supabase/server";
+import type { DashboardExpensePayment, DashboardInvoicePayment } from "@/services/dashboard";
 import { expenseRowSchema } from "@/services/expenses";
 import { getEffectiveInvoiceStatus, getInvoiceDirection, getInvoiceRemainingAmount, getVerifiedInvoiceSourceDocumentCategory } from "@/services/invoice-validation";
 import type { InvoiceRecord } from "@/types/invoice";
@@ -12,6 +13,25 @@ const amountSchema = z.union([
   z.number(),
   z.string().regex(/^-?\d+(?:\.\d+)?$/).transform(Number),
 ]).nullable();
+const paymentAmountSchema = z.union([
+  z.number(),
+  z.string().regex(/^\d+(?:\.\d+)?$/).transform(Number),
+]).refine((amount) => Number.isFinite(amount) && amount > 0);
+const invoicePaymentRowsSchema = z.array(z.object({
+  invoice_id: z.uuid(),
+  amount: paymentAmountSchema,
+  payment_date: z.iso.date(),
+}));
+const expensePaymentRowsSchema = z.array(z.object({
+  expense_id: z.uuid(),
+  amount: paymentAmountSchema,
+  payment_date: z.iso.date(),
+}));
+const linkedSupplierExpenseRowsSchema = z.array(z.object({
+  id: z.uuid(),
+  invoice_id: z.uuid(),
+  status: z.enum(["pending", "paid", "overdue", "cancelled"]),
+}));
 const invoiceSchema = z.array(z.object({
   id: z.uuid(),
   user_id: z.uuid().nullable(),
@@ -259,7 +279,7 @@ export default async function DashboardPage() {
 
   const invoiceIds = invoices.map(({ id }) => id);
   const customerPaymentsResult = invoiceIds.length
-    ? await supabase.from("invoice_payments").select("invoice_id, amount").in("invoice_id", invoiceIds)
+    ? await supabase.from("invoice_payments").select("invoice_id, amount, payment_date").in("invoice_id", invoiceIds)
     : { data: [], error: null };
   const paymentLedgerUnavailable = Boolean(customerPaymentsResult.error
     && ["42P01", "42703", "PGRST202", "PGRST204", "PGRST205"].includes(customerPaymentsResult.error.code ?? ""));
@@ -272,13 +292,24 @@ export default async function DashboardPage() {
     partialDataWarning = [partialDataWarning, "Appliquez la migration 017 pour charger les paiements partiels et le sens explicite des factures."]
       .filter(Boolean).join(" ");
   }
-  const customerPaymentsAvailable = !customerPaymentsResult.error;
+  const parsedCustomerPayments = invoicePaymentRowsSchema.safeParse(
+    customerPaymentsResult.error ? [] : customerPaymentsResult.data ?? [],
+  );
+  const customerPaymentsAvailable = !customerPaymentsResult.error && parsedCustomerPayments.success;
+  if (!customerPaymentsResult.error && !parsedCustomerPayments.success) {
+    console.error("Dashboard invoice payment query returned an unexpected result");
+    partialDataWarning = [partialDataWarning, "Les paiements clients reçus ne sont pas au format attendu."]
+      .filter(Boolean).join(" ");
+  }
   const paidByInvoice = new Map<string, number>();
-  for (const payment of customerPaymentsResult.error ? [] : customerPaymentsResult.data ?? []) {
-    const row = payment as { invoice_id: string; amount: number | string };
-    const amount = typeof row.amount === "number" ? row.amount : Number(row.amount);
-    if (!Number.isFinite(amount)) continue;
-    paidByInvoice.set(row.invoice_id, Math.round(((paidByInvoice.get(row.invoice_id) ?? 0) + amount) * 100) / 100);
+  const customerPaymentEvents: DashboardInvoicePayment[] = [];
+  for (const payment of parsedCustomerPayments.success ? parsedCustomerPayments.data : []) {
+    paidByInvoice.set(payment.invoice_id, Math.round(((paidByInvoice.get(payment.invoice_id) ?? 0) + payment.amount) * 100) / 100);
+    customerPaymentEvents.push({
+      invoiceId: payment.invoice_id,
+      paymentDate: payment.payment_date,
+      amount: payment.amount,
+    });
   }
 
   const supplierInvoiceIds = invoices.flatMap((invoice) => (
@@ -287,28 +318,55 @@ export default async function DashboardPage() {
   const linkedExpensesResult = supplierInvoiceIds.length
     ? await supabase.from("expenses").select("id, invoice_id, status").in("invoice_id", supplierInvoiceIds)
     : { data: [], error: null };
+  const parsedLinkedExpenses = linkedSupplierExpenseRowsSchema.safeParse(
+    linkedExpensesResult.error ? [] : linkedExpensesResult.data ?? [],
+  );
   const paidBySupplierInvoice = new Map<string, number>();
-  let supplierPaymentsAvailable = !linkedExpensesResult.error;
+  const supplierExpenseIds = new Set<string>();
+  const supplierExpenseInvoiceById = new Map<string, string>();
+  const supplierPaymentEvents: DashboardExpensePayment[] = [];
+  let supplierPaymentsAvailable = !linkedExpensesResult.error && parsedLinkedExpenses.success;
   if (linkedExpensesResult.error) {
     console.error("Dashboard supplier invoice expense query failed", { code: linkedExpensesResult.error.code });
     partialDataWarning = [partialDataWarning, "Les paiements fournisseurs liés aux dépenses ne sont pas disponibles."]
       .filter(Boolean).join(" ");
-  } else if (linkedExpensesResult.data?.length) {
-    const linkedExpenses = linkedExpensesResult.data as { id: string; invoice_id: string; status: string }[];
+  } else if (!parsedLinkedExpenses.success) {
+    console.error("Dashboard supplier invoice expense query returned an unexpected result");
+    partialDataWarning = [partialDataWarning, "Les paiements fournisseurs liés aux dépenses ne sont pas au format attendu."]
+      .filter(Boolean).join(" ");
+    supplierPaymentsAvailable = false;
+  } else if (parsedLinkedExpenses.data.length) {
+    const linkedExpenses = parsedLinkedExpenses.data;
     const expenseIds = linkedExpenses.map(({ id }) => id);
-    const supplierPaymentsResult = await supabase.from("expense_payments").select("expense_id, amount").in("expense_id", expenseIds);
+    for (const expense of linkedExpenses) {
+      supplierExpenseIds.add(expense.id);
+      supplierExpenseInvoiceById.set(expense.id, expense.invoice_id);
+    }
+    const supplierPaymentsResult = await supabase.from("expense_payments")
+      .select("expense_id, payment_date, amount")
+      .in("expense_id", expenseIds);
+    const parsedSupplierPayments = expensePaymentRowsSchema.safeParse(
+      supplierPaymentsResult.error ? [] : supplierPaymentsResult.data ?? [],
+    );
     const paidByExpense = new Map<string, number>();
-    if (supplierPaymentsResult.error) {
+    if (supplierPaymentsResult.error || !parsedSupplierPayments.success) {
       supplierPaymentsAvailable = false;
-      console.error("Dashboard supplier payment query failed", { code: supplierPaymentsResult.error.code });
+      console.error(
+        supplierPaymentsResult.error
+          ? "Dashboard supplier payment query failed"
+          : "Dashboard supplier payment query returned an unexpected result",
+        supplierPaymentsResult.error ? { code: supplierPaymentsResult.error.code } : undefined,
+      );
       partialDataWarning = [partialDataWarning, "L’historique des paiements fournisseurs est indisponible."]
         .filter(Boolean).join(" ");
     } else {
-      for (const payment of supplierPaymentsResult.data ?? []) {
-        const row = payment as { expense_id: string; amount: number | string };
-        const amount = typeof row.amount === "number" ? row.amount : Number(row.amount);
-        if (!Number.isFinite(amount)) continue;
-        paidByExpense.set(row.expense_id, Math.round(((paidByExpense.get(row.expense_id) ?? 0) + amount) * 100) / 100);
+      for (const payment of parsedSupplierPayments.data) {
+        paidByExpense.set(payment.expense_id, Math.round(((paidByExpense.get(payment.expense_id) ?? 0) + payment.amount) * 100) / 100);
+        supplierPaymentEvents.push({
+          expenseId: payment.expense_id,
+          paymentDate: payment.payment_date,
+          amount: payment.amount,
+        });
       }
     }
     for (const expense of linkedExpenses) {
@@ -365,6 +423,40 @@ export default async function DashboardPage() {
     }
   }
 
+  let expensePaymentHistoryAvailable = !expensesLoadError && supplierPaymentsAvailable;
+  const expensePaymentEvents: DashboardExpensePayment[] = [...supplierPaymentEvents];
+  const otherExpenseIds = expenses
+    .map(({ id }) => id)
+    .filter((id) => !supplierExpenseIds.has(id));
+  if (otherExpenseIds.length) {
+    const expensePaymentsResult = await supabase.from("expense_payments")
+      .select("expense_id, payment_date, amount")
+      .in("expense_id", otherExpenseIds);
+    const parsedExpensePayments = expensePaymentRowsSchema.safeParse(
+      expensePaymentsResult.error ? [] : expensePaymentsResult.data ?? [],
+    );
+    if (expensePaymentsResult.error || !parsedExpensePayments.success) {
+      expensePaymentHistoryAvailable = false;
+      console.error(
+        expensePaymentsResult.error
+          ? "Dashboard expense payment query failed"
+          : "Dashboard expense payment query returned an unexpected result",
+        expensePaymentsResult.error ? { code: expensePaymentsResult.error.code } : undefined,
+      );
+      partialDataWarning = [
+        partialDataWarning,
+        "L’historique des paiements de dépenses n’est pas disponible ; les sorties correspondantes ne sont pas tracées.",
+      ].filter(Boolean).join(" ");
+    } else {
+      expensePaymentEvents.push(...parsedExpensePayments.data.map((payment) => ({
+        expenseId: payment.expense_id,
+        paymentDate: payment.payment_date,
+        amount: payment.amount,
+      })));
+    }
+  }
+  if (expensesLoadError) expensePaymentHistoryAvailable = false;
+
   return (
     <AppShell pageTitle="home">
       <DashboardClient
@@ -379,12 +471,19 @@ export default async function DashboardPage() {
           expenseDate: expense.expense_date,
           category: expense.category,
           supplierId: expense.supplier_id,
+          invoiceId: supplierExpenseInvoiceById.get(expense.id) ?? null,
           supplierName: null,
           status: expense.status,
           notes: expense.notes,
           createdAt: expense.created_at,
           updatedAt: expense.updated_at,
         }))}
+        customerPayments={customerPaymentEvents}
+        expensePayments={expensePaymentEvents}
+        paymentHistoryAvailability={{
+          customer: customerPaymentsAvailable,
+          expenses: expensePaymentHistoryAvailable,
+        }}
         companies={companies.data}
         counterpartyNames={counterpartyNames}
         partyLinksAvailable={personalResult.hasPartyLinks && companyRowsHavePartyLinks}

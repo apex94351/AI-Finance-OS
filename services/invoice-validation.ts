@@ -207,6 +207,7 @@ export function getEffectiveInvoiceStatus(
   currentDate = new Date(),
 ): InvoiceStatus {
   if (status === "paid" || status === "draft" || status === "cancelled") return status;
+  if (status === "overdue") return "overdue";
   return deriveInvoiceStatus(dueDate, currentDate);
 }
 

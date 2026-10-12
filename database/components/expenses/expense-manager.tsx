@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useCallback, useMemo, useState, useTransition } from "react";
+import { Fragment, useCallback, useMemo, useState, useTransition, type FocusEvent, type PointerEvent } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { ArrowDownWideNarrow, ArrowLeft, ArrowRight, FileText, Plus, Search } from "lucide-react";
@@ -9,6 +9,7 @@ import { Badge } from "@/database/components/ui/badge";
 import { EmptyState } from "@/database/components/ui/empty-state";
 import {
   buildAnnualExpenseSeries,
+  buildCurrentMonthRecurringExpenseTotals,
   buildMonthlyExpenseSeries,
   buildExpenseFinancialSummary,
   filterExpenses,
@@ -23,6 +24,7 @@ import {
 import { ExpenseForm } from "./expense-form";
 import { ExpensePaymentForm } from "./expense-payment-form";
 import { RecurringExpenseForm } from "./recurring-expense-form";
+import { SupplierInvoicePaymentForm } from "@/database/components/invoices/supplier-invoice-payment-form";
 
 export interface ExpenseCompany {
   id: string;
@@ -147,6 +149,15 @@ export function ExpenseManager({
       : buildAnnualExpenseSeries(expenses, maxYear, today),
     [chartMode, expenses, maxYear, selectedYear, today],
   );
+  const recurringChartTotals = useMemo(
+    () => buildCurrentMonthRecurringExpenseTotals(recurringExpenses, expenses, today),
+    [expenses, recurringExpenses, today],
+  );
+  const chartIncludesCurrentMonth = chartMode === "year" || selectedYear === maxYear;
+  const chartCurrencies = useMemo(() => [...new Set([
+    ...expenses.filter((expense) => expense.status !== "cancelled").map(({ currency }) => currency),
+    ...(chartIncludesCurrentMonth ? [...recurringChartTotals.keys()] : []),
+  ])].sort((left, right) => left.localeCompare(right)), [chartIncludesCurrentMonth, expenses, recurringChartTotals]);
   const recentExpenses = useMemo(
     () => [...expenses].sort((left, right) => right.expenseDate.localeCompare(left.expenseDate)).slice(0, 5),
     [expenses],
@@ -245,6 +256,9 @@ export function ExpenseManager({
             <article className="surface-panel invoice-summary-card"><span>Payé ce mois-ci</span><CurrencyTotals totals={summary.paidThisMonth} /></article>
             <article className="surface-panel invoice-summary-card"><span>En retard · solde restant</span><CurrencyTotals totals={summary.overdue} /></article>
           </section>
+          {summary.incompleteBalanceCount > 0 ? <p className="dashboard-partial-warning" role="status">
+            Le solde restant de {summary.incompleteBalanceCount} dépense{summary.incompleteBalanceCount === 1 ? "" : "s"} n’est pas inclus dans les totaux : l’historique des paiements doit être vérifié.
+          </p> : null}
           <p className="dashboard-note expense-payment-note">« Payé ce mois-ci » ne compte que les paiements enregistrés avec une date. Les factures fournisseurs déjà marquées payées sans historique daté ne sont pas ajoutées à cet indicateur.</p>
 
           <section className="surface-panel expense-chart-panel" aria-labelledby="expense-chart-heading">
@@ -262,15 +276,29 @@ export function ExpenseManager({
                 </div> : null}
               </div>
             </div>
-            {chartData.length && expenses.some(({ status: itemStatus }) => itemStatus !== "cancelled") ? (
-              [...new Set(expenses.filter(({ status: itemStatus }) => itemStatus !== "cancelled").map(({ currency }) => currency))].map((currency) => {
-                const currencyData = chartMode === "month"
+            {chartData.length && chartCurrencies.length ? (
+              chartCurrencies.map((currency) => {
+                const sourceData = chartMode === "month"
                   ? buildMonthlyExpenseSeries(expenses.filter((expense) => expense.currency === currency), selectedYear, today)
                   : buildAnnualExpenseSeries(expenses.filter((expense) => expense.currency === currency), maxYear, today);
-                return <ExpenseChart key={currency} data={currencyData} max={Math.max(0, ...currencyData.flatMap(({ amount }) => amount === null ? [] : [amount]))} currency={currency} />;
+                const scheduledAmount = chartIncludesCurrentMonth ? recurringChartTotals.get(currency) ?? 0 : 0;
+                const currentPeriod = chartMode === "month" ? today.slice(0, 7) : String(maxYear);
+                const currencyData = sourceData.map((bucket) => {
+                  const recurringAmount = bucket.period === currentPeriod ? scheduledAmount : 0;
+                  const actualAmount = bucket.amount ?? 0;
+                  return {
+                    ...bucket,
+                    actualAmount,
+                    recurringAmount,
+                    amount: bucket.amount === null ? null : actualAmount + recurringAmount,
+                  };
+                });
+                const maximum = Math.max(0, ...currencyData.flatMap(({ amount }) => amount === null ? [] : [amount]));
+                return <ExpenseChart key={currency} data={currencyData} max={maximum} currency={currency} />;
               })
             ) : <EmptyState icon={<FileText size={22} />} title="Aucune dépense à représenter" description="Les séries apparaîtront dès qu’une dépense réelle sera enregistrée." />}
-            <p className="dashboard-note">Une dépense est rattachée à sa date de facture ou de dépense. Les factures fournisseurs liées ne sont comptées qu’une fois ; les mois futurs restent distincts des mois à zéro.</p>
+            <p className="expense-chart-legend"><span className="expense-chart-legend-actual" />Dépenses enregistrées{chartIncludesCurrentMonth && [...recurringChartTotals.values()].some((amount) => amount > 0) ? <><span className="expense-chart-legend-recurring" />Échéances récurrentes prévues dans le mois courant</> : null}</p>
+            <p className="dashboard-note">Les occurrences récurrentes prévues ne couvrent que le mois courant et sont dédupliquées avec celles déjà enregistrées. Les mois futurs restent non valorisés.</p>
           </section>
 
           {showForm ? <section className="surface-panel invoice-form-panel expense-form-panel" aria-labelledby="expense-form-heading">
@@ -301,13 +329,23 @@ export function ExpenseManager({
 
           {paying ? <section className="surface-panel invoice-form-panel expense-form-panel">
             <div className="invoice-form-title"><div><span className="panel-kicker">Paiement partiel ou total</span><h2>Enregistrer un paiement · {paying.label}</h2></div><button className="text-button" type="button" onClick={() => setPaying(null)}>Fermer</button></div>
-            <ExpensePaymentForm
-              companyId={paying.companyId}
-              expenseId={paying.id}
-              balance={paying.status === "paid" ? 0 : Math.max(0, paying.amount - (paying.paidAmount ?? 0))}
-              today={today}
-              onSaved={handlePaymentSaved}
-            />
+            {paying.sourceType === "supplier_invoice" && paying.invoiceId ? (
+              <SupplierInvoicePaymentForm
+                companyId={paying.companyId}
+                invoiceId={paying.invoiceId}
+                balance={Math.max(0, paying.amount - (paying.paidAmount ?? 0))}
+                today={today}
+                onSaved={handlePaymentSaved}
+              />
+            ) : (
+              <ExpensePaymentForm
+                companyId={paying.companyId}
+                expenseId={paying.id}
+                balance={paying.status === "paid" ? 0 : Math.max(0, paying.amount - (paying.paidAmount ?? 0))}
+                today={today}
+                onSaved={handlePaymentSaved}
+              />
+            )}
           </section> : null}
 
           <section className="surface-panel expense-recurrence-panel" aria-labelledby="expense-recurring-heading">
@@ -421,7 +459,9 @@ function ExpenseRow({
   isPending: boolean;
 }) {
   const sourceInvoice = expense.sourceType === "supplier_invoice";
-  const balance = expense.status === "paid" ? 0 : Math.max(0, expense.amount - (expense.paidAmount ?? 0));
+  const balance = expense.status === "paid" ? 0
+    : expense.paidAmount === null ? null
+      : Math.max(0, expense.amount - (expense.paidAmount ?? 0));
   return (
     <>
       <tr>
@@ -430,13 +470,18 @@ function ExpenseRow({
         <td>{dateLabel(expense.expenseDate)}</td>
         <td>{expense.category ?? "—"}</td>
         <td><Badge tone={statusTone[expense.status]}>{statusLabel[expense.status]}</Badge></td>
-        <td className="invoice-amount-cell">{money(expense.amount, expense.currency)}{balance > 0 && expense.paidAmount ? <small className="expense-row-note">Reste {money(balance, expense.currency)}</small> : null}</td>
+        <td className="invoice-amount-cell">{money(expense.amount, expense.currency)}{balance === null ? <small className="expense-row-note">Solde à vérifier</small> : balance > 0 && expense.paidAmount ? <small className="expense-row-note">Reste {money(balance, expense.currency)}</small> : null}</td>
         <td className="expense-row-actions">
           <button className="text-button" type="button" aria-expanded={expanded} onClick={onToggle}>Détail</button>
-          {sourceInvoice ? <Link className="text-button" href="/invoices">Facture</Link> : (
+          {sourceInvoice ? (
+            <>
+              <Link className="text-button" href={`/invoices#invoice-${expense.invoiceId}`}>Facture</Link>
+              {balance !== null && balance > 0 ? <button className="text-button" type="button" onClick={onPay}>Payer</button> : null}
+            </>
+          ) : (
             <>
               {expense.invoiceId ? <button className="text-button" type="button" disabled={isPending} onClick={onDelete}>Dissocier la facture</button> : <button className="text-button" type="button" onClick={onEdit}>Modifier</button>}
-              {balance > 0 ? <button className="text-button" type="button" onClick={onPay}>Payer</button> : null}
+              {balance !== null && balance > 0 ? <button className="text-button" type="button" onClick={onPay}>Payer</button> : null}
               {!expense.invoiceId && !expense.recurrenceId ? <button className="text-button expense-danger-button" type="button" disabled={isPending} onClick={onDelete}>Supprimer</button> : null}
             </>
           )}
@@ -447,7 +492,9 @@ function ExpenseRow({
           <div><dt>Date d’échéance</dt><dd>{expense.dueDate ? dateLabel(expense.dueDate) : "Non renseignée"}</dd></div>
           <div><dt>Montant HT</dt><dd>{expense.subtotalHt === null || expense.subtotalHt === undefined ? "Non renseigné" : money(expense.subtotalHt, expense.currency)}</dd></div>
           <div><dt>TVA</dt><dd>{expense.vatAmount === null || expense.vatAmount === undefined ? "Non renseignée" : money(expense.vatAmount, expense.currency)}</dd></div>
-          <div><dt>Payé / restant dû</dt><dd>{money(expense.status === "paid" ? expense.amount : expense.paidAmount ?? 0, expense.currency)} / {money(balance, expense.currency)}</dd></div>
+          <div><dt>Payé / restant dû</dt><dd>{balance === null
+            ? "Montant payé et solde à vérifier"
+            : `${money(expense.status === "paid" ? expense.amount : expense.paidAmount ?? 0, expense.currency)} / ${money(balance, expense.currency)}`}</dd></div>
           {expense.invoiceId ? <div><dt>Facture associée</dt><dd><Link href="/invoices">{expense.invoiceNumber ?? "Ouvrir la facture"}</Link></dd></div> : null}
           {expense.documentId && expense.documentName ? <div><dt>Justificatif</dt><dd><Link href={`/documents#document-${encodeURIComponent(expense.documentId)}`}>{expense.documentName}</Link></dd></div> : null}
           {expense.notes ? <div className="expense-detail-wide"><dt>Notes</dt><dd>{expense.notes}</dd></div> : null}
@@ -457,7 +504,11 @@ function ExpenseRow({
   );
 }
 
-function ExpenseChart({ data, max, currency }: { data: { period: string; label: string; amount: number | null }[]; max: number; currency: string }) {
+function ExpenseChart({ data, max, currency }: {
+  data: Array<{ period: string; label: string; amount: number | null; actualAmount: number; recurringAmount: number }>;
+  max: number;
+  currency: string;
+}) {
   const width = 760;
   const height = 240;
   const top = 16;
@@ -465,6 +516,25 @@ function ExpenseChart({ data, max, currency }: { data: { period: string; label: 
   const plotHeight = height - top - bottom;
   const slot = width / Math.max(data.length, 1);
   const barWidth = Math.min(34, slot * 0.58);
+  const [tooltip, setTooltip] = useState<{ label: string; text: string; left: number; top: number } | null>(null);
+  const openTooltip = (
+    item: (typeof data)[number],
+    event: PointerEvent<SVGGElement> | FocusEvent<SVGGElement>,
+  ) => {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const label = item.period.length === 7 ? `${item.label} ${item.period.slice(0, 4)}` : item.label;
+    const text = item.amount === null
+      ? `${label} · période future, aucune valeur comptabilisée.`
+      : item.recurringAmount > 0
+        ? `${label} · total ${money(item.amount, currency)}, dont ${money(item.actualAmount, currency)} enregistrés et ${money(item.recurringAmount, currency)} d’échéances récurrentes prévues.`
+        : `${label} · ${money(item.amount, currency)} enregistrés.`;
+    setTooltip({
+      label,
+      text,
+      left: Math.max(120, Math.min(bounds.left + bounds.width / 2, window.innerWidth - 120)),
+      top: Math.max(54, bounds.top - 8),
+    });
+  };
   return (
     <div className="dashboard-chart-scroll">
       <svg className="dashboard-expense-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`Évolution des dépenses en ${currency}`}>
@@ -474,19 +544,43 @@ function ExpenseChart({ data, max, currency }: { data: { period: string; label: 
         })}
         {data.map((item, index) => {
           const x = index * slot + (slot - barWidth) / 2;
-          const amount = item.amount ?? 0;
-          const barHeight = max > 0 ? amount / max * plotHeight : 0;
-          const y = top + plotHeight - barHeight;
+          const actualHeight = max > 0 ? item.actualAmount / max * plotHeight : 0;
+          const recurringHeight = max > 0 ? item.recurringAmount / max * plotHeight : 0;
+          const actualY = top + plotHeight - actualHeight;
+          const recurringY = actualY - recurringHeight;
+          const label = item.period.length === 7 ? `${item.label} ${item.period.slice(0, 4)}` : item.label;
+          const ariaLabel = item.amount === null
+            ? `${label} · période future, valeur non disponible`
+            : item.recurringAmount > 0
+              ? `${label} · total ${money(item.amount, currency)}, ${money(item.actualAmount, currency)} enregistrés, ${money(item.recurringAmount, currency)} récurrents prévus`
+              : `${label} · ${money(item.amount, currency)} enregistrés`;
           return <g key={item.period}>
-            {item.amount === null
-              ? <rect x={x} y={top + plotHeight - 3} width={barWidth} height="3" className="expense-chart-future" />
-              : <rect className="dashboard-chart-bar" x={x} y={y} width={barWidth} height={Math.max(barHeight, amount > 0 ? 1 : 0)} rx="3">
-                <title>{`${item.label} : ${money(amount, currency)}`}</title>
-              </rect>}
+            <g
+              className="expense-chart-interactive-bucket"
+              data-period={item.period}
+              role="img"
+              aria-label={ariaLabel}
+              tabIndex={0}
+              onPointerEnter={(event) => openTooltip(item, event)}
+              onPointerDown={(event) => openTooltip(item, event)}
+              onPointerLeave={(event) => { if (event.pointerType !== "touch") setTooltip(null); }}
+              onFocus={(event) => openTooltip(item, event)}
+              onBlur={() => setTooltip(null)}
+              onKeyDown={(event) => { if (event.key === "Escape") setTooltip(null); }}
+            >
+              <title>{ariaLabel}</title>
+              <rect className="expense-chart-hit-area" x={index * slot} y={top} width={slot} height={plotHeight} />
+              {item.amount === null ? <rect x={x} y={top + plotHeight - 3} width={barWidth} height="3" className="expense-chart-future" /> : null}
+              {item.amount !== null && item.actualAmount > 0 ? <rect className="dashboard-chart-bar" x={x} y={actualY} width={barWidth} height={Math.max(actualHeight, 1)} rx="3" /> : null}
+              {item.amount !== null && item.recurringAmount > 0 ? <rect className="expense-chart-recurring-bar" x={x} y={recurringY} width={barWidth} height={Math.max(recurringHeight, 1)} rx="3" /> : null}
+            </g>
             <text className="dashboard-chart-axis" textAnchor="middle" x={x + barWidth / 2} y={height - 12}>{item.label}</text>
           </g>;
         })}
       </svg>
+      {tooltip ? <div className="expense-chart-tooltip" role="tooltip" style={{ left: tooltip.left, top: tooltip.top }}>
+        <strong>{tooltip.label}</strong><span>{tooltip.text}</span>
+      </div> : null}
     </div>
   );
 }

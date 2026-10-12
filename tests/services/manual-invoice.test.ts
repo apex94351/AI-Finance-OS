@@ -51,7 +51,7 @@ describe("manual invoice validation and calculations", () => {
     expect(getPersistedInvoiceStatus("pending", "2026-10-09", currentDate)).toBe("overdue");
     expect(getPersistedInvoiceStatus("pending", "2026-10-10", currentDate)).toBe("pending");
     expect(getPersistedInvoiceStatus("paid", "2026-10-09", currentDate)).toBe("paid");
-    expect(getPersistedInvoiceStatus("overdue", "2026-10-11", currentDate)).toBeNull();
+    expect(getPersistedInvoiceStatus("overdue", "2026-10-11", currentDate)).toBe("overdue");
     expect(getPersistedInvoiceStatus("overdue", "2026-10-09", currentDate)).toBe("overdue");
     expect(getPersistedInvoiceStatus("receivable", null, currentDate)).toBe("pending");
     expect(getPersistedInvoiceStatus("paid", "2026-10-11", currentDate)).toBe("paid");

@@ -75,7 +75,7 @@ export function getPersistedInvoiceStatus(
   const today = currentDate.toISOString().slice(0, 10);
   if (status === "paid") return "paid";
   if (status === "draft" || status === "cancelled") return null;
-  if (status === "overdue") return dueDate && dueDate < today ? "overdue" : null;
+  if (status === "overdue") return "overdue";
   return dueDate && dueDate < today ? "overdue" : "pending";
 }
 

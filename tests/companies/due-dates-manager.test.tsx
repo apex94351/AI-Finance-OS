@@ -68,7 +68,7 @@ describe("deadline manager", () => {
     expect(screen.getByText(/ne représente pas le solde bancaire réel/)).toBeTruthy();
   });
 
-  it("includes undated expenses in totals without showing them as dated deadlines", () => {
+  it("does not include undated expenses in totals when they are absent from the due-date list", () => {
     render(
       <DeadlineManager
         invoices={[{
@@ -93,9 +93,30 @@ describe("deadline manager", () => {
 
     const indicators = screen.getByRole("region", { name: "Prévisionnel des échéances" });
     const cards = within(indicators).getAllByRole("article");
-    expect(cards[1]?.textContent).toContain("75,00");
-    expect(cards[2]?.textContent).toContain("-75,00");
+    expect(cards[1]?.textContent).toContain("0,00");
+    expect(cards[2]?.textContent).toContain("0,00");
     expect(screen.getByText("Aucune échéance active")).toBeTruthy();
+  });
+
+  it("keeps an unclassified invoice visible and explains how to qualify its direction", () => {
+    render(<DeadlineManager invoices={[{
+      id: "unclassified-invoice",
+      sourceType: "invoice",
+      invoiceType: null,
+      companyId: null,
+      invoiceNumber: "FAC-A-QUALIFIER",
+      clientName: "Tiers non confirmé",
+      dueDate: "2026-10-15",
+      total: 100,
+      currency: "EUR",
+      status: "pending",
+    }]} loadError={null} asOfDate="2026-10-10" />);
+
+    expect(screen.getByText("Facture FAC-A-QUALIFIER")).toBeTruthy();
+    expect(screen.getByText("Sens à préciser")).toBeTruthy();
+    expect(screen.getByRole("status").textContent).toContain("Associez-la à un client ou un fournisseur");
+    const indicators = screen.getByRole("region", { name: "Prévisionnel des échéances" });
+    expect(within(indicators).getAllByText(/0,00/)).toHaveLength(3);
   });
 
   it("keeps a one-cent forecast balance visually neutral", () => {

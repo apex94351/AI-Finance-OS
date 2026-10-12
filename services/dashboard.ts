@@ -36,17 +36,38 @@ export interface DashboardDateRange {
   valid: boolean;
 }
 
-export interface DashboardChartBucket {
+export type DashboardChartInterval = "day" | "week" | "month";
+
+export interface DashboardCashflowPoint {
   date: string;
+  inflows: number | null;
+  outflows: number | null;
+  balance?: number | null;
+}
+
+export interface DashboardCashflowSeries {
+  currency: string;
+  interval: DashboardChartInterval;
+  buckets: DashboardCashflowPoint[];
+}
+
+export interface DashboardInvoicePayment {
+  id?: string;
+  invoiceId: string;
+  paymentDate: string;
   amount: number;
 }
 
-export type DashboardChartInterval = "day" | "week" | "month";
+export interface DashboardExpensePayment {
+  id?: string;
+  expenseId: string;
+  paymentDate: string;
+  amount: number;
+}
 
-export interface DashboardPaidExpenseSeries {
-  currency: string;
-  interval: DashboardChartInterval;
-  buckets: DashboardChartBucket[];
+export interface DashboardPaymentHistoryAvailability {
+  customer: boolean;
+  expenses: boolean;
 }
 
 export interface DashboardCockpit {
@@ -58,7 +79,9 @@ export interface DashboardCockpit {
   overdueCustomerInvoices: InvoiceRecord[];
   upcomingSupplierInvoices: InvoiceRecord[];
   upcomingInvoices: InvoiceRecord[];
-  paidExpenseSeries: DashboardPaidExpenseSeries[];
+  cashflowSeries: DashboardCashflowSeries[];
+  customerPaymentTotals: CurrencyTotal[];
+  expensePaymentTotals: CurrencyTotal[];
 }
 
 const dayMilliseconds = 86_400_000;
@@ -123,7 +146,9 @@ export function resolveDashboardDateRange(
   }
   const startDate = period === "7d"
     ? dateFromOrdinal(dateOrdinal(asOfDate)! - 6)
-    : addMonths(asOfDate, period === "1m" ? -1 : period === "3m" ? -3 : period === "6m" ? -6 : -12);
+    : period === "1m"
+      ? dateFromOrdinal(dateOrdinal(asOfDate)! - 29)
+      : addMonths(asOfDate, period === "3m" ? -3 : period === "6m" ? -6 : -12);
   return { startDate, endDate: asOfDate, valid: true };
 }
 
@@ -199,12 +224,15 @@ export function buildDashboardCockpit(
   expenses: ExpenseRecord[],
   range: DashboardDateRange,
   asOfDate: string,
+  invoicePayments: DashboardInvoicePayment[] = [],
+  expensePayments: DashboardExpensePayment[] = [],
+  paymentHistoryAvailability: DashboardPaymentHistoryAvailability = { customer: true, expenses: true },
+  cashflowCurrencies: string[] = [],
 ): DashboardCockpit {
   const receivableTotals = new Map<string, number>();
   const payableTotals = new Map<string, number>();
   const invoicedTotals = new Map<string, number>();
   const expenseTotals = new Map<string, number>();
-  const paidExpenseBuckets = new Map<string, Map<string, number>>();
   const todayOrdinal = dateOrdinal(asOfDate);
   const overdueInvoices: InvoiceRecord[] = [];
   const overdueCustomerInvoices: InvoiceRecord[] = [];
@@ -212,17 +240,17 @@ export function buildDashboardCockpit(
   const upcomingInvoices: InvoiceRecord[] = [];
 
   for (const invoice of invoices) {
+    const status = getEffectiveInvoiceStatus(invoice.status, invoice.dueDate, new Date(`${asOfDate}T00:00:00Z`));
     const balance = invoiceBalance(invoice, asOfDate);
     if (balance !== null) {
       if (getInvoiceDirection(invoice) === "supplier") addMoney(payableTotals, balance, invoice.currency);
       else if (isCustomerInvoice(invoice)) addMoney(receivableTotals, balance, invoice.currency);
 
       const dueOrdinal = dateOrdinal(invoice.dueDate);
-      if (dueOrdinal !== null && todayOrdinal !== null) {
-        if (dueOrdinal < todayOrdinal) {
-          overdueInvoices.push(invoice);
-          if (isCustomerInvoice(invoice)) overdueCustomerInvoices.push(invoice);
-        }
+      if (status === "overdue") {
+        overdueInvoices.push(invoice);
+        if (isCustomerInvoice(invoice)) overdueCustomerInvoices.push(invoice);
+      } else if (dueOrdinal !== null && todayOrdinal !== null) {
         if (getInvoiceDirection(invoice) === "supplier" && dueOrdinal >= todayOrdinal && dueOrdinal - todayOrdinal <= 30) {
           upcomingSupplierInvoices.push(invoice);
         }
@@ -239,14 +267,48 @@ export function buildDashboardCockpit(
   for (const expense of expenses) {
     if (expense.status === "cancelled" || !isWithinRange(expense.expenseDate, range)) continue;
     addMoney(expenseTotals, expense.amount, expense.currency);
-    if (expense.status === "paid"
-      && Number.isFinite(expense.amount)
-      && expense.amount > 0
-      && /^[A-Z]{3}$/.test(expense.currency)) {
-      const key = bucketDate(expense.expenseDate, range);
-      const byCurrency = paidExpenseBuckets.get(expense.currency) ?? new Map<string, number>();
-      byCurrency.set(key, (byCurrency.get(key) ?? 0) + Math.round(expense.amount * 100));
-      paidExpenseBuckets.set(expense.currency, byCurrency);
+  }
+
+  const customerPaymentTotals = new Map<string, number>();
+  const expensePaymentTotals = new Map<string, number>();
+  const flowBuckets = new Map<string, { inflows: Map<string, number>; outflows: Map<string, number> }>();
+  const invoicesById = new Map(invoices.map((invoice) => [invoice.id, invoice]));
+  const expensesById = new Map(expenses.map((expense) => [expense.id, expense]));
+
+  for (const payment of invoicePayments) {
+    const invoice = invoicesById.get(payment.invoiceId);
+    if (!invoice || !isCustomerInvoice(invoice) || invoice.status === "cancelled" || invoice.status === "draft"
+      || !isWithinRange(payment.paymentDate, range) || !Number.isFinite(payment.amount) || payment.amount <= 0
+      || !invoice.currency || !/^[A-Z]{3}$/.test(invoice.currency)) continue;
+    const cents = Math.round(payment.amount * 100);
+    const key = bucketDate(payment.paymentDate, range);
+    const byCurrency = flowBuckets.get(invoice.currency) ?? { inflows: new Map<string, number>(), outflows: new Map<string, number>() };
+    byCurrency.inflows.set(key, (byCurrency.inflows.get(key) ?? 0) + cents);
+    flowBuckets.set(invoice.currency, byCurrency);
+    customerPaymentTotals.set(invoice.currency, (customerPaymentTotals.get(invoice.currency) ?? 0) + cents);
+  }
+
+  for (const payment of expensePayments) {
+    const expense = expensesById.get(payment.expenseId);
+    if (!expense || expense.status === "cancelled"
+      || !isWithinRange(payment.paymentDate, range) || !Number.isFinite(payment.amount) || payment.amount <= 0) continue;
+    const linkedInvoice = expense.invoiceId ? invoicesById.get(expense.invoiceId) : undefined;
+    if (linkedInvoice?.status === "cancelled") continue;
+    const currency = linkedInvoice && getInvoiceDirection(linkedInvoice) === "supplier"
+      ? linkedInvoice.currency
+      : expense.currency;
+    if (!currency || !/^[A-Z]{3}$/.test(currency)) continue;
+    const cents = Math.round(payment.amount * 100);
+    const key = bucketDate(payment.paymentDate, range);
+    const byCurrency = flowBuckets.get(currency) ?? { inflows: new Map<string, number>(), outflows: new Map<string, number>() };
+    byCurrency.outflows.set(key, (byCurrency.outflows.get(key) ?? 0) + cents);
+    flowBuckets.set(currency, byCurrency);
+    expensePaymentTotals.set(currency, (expensePaymentTotals.get(currency) ?? 0) + cents);
+  }
+
+  for (const currency of cashflowCurrencies) {
+    if (/^[A-Z]{3}$/.test(currency) && !flowBuckets.has(currency)) {
+      flowBuckets.set(currency, { inflows: new Map<string, number>(), outflows: new Map<string, number>() });
     }
   }
 
@@ -254,14 +316,19 @@ export function buildDashboardCockpit(
     (left.dueDate ?? "").localeCompare(right.dueDate ?? "");
   const bucketDates = getBucketDates(range);
   const bucketInterval = getBucketInterval(range);
-  const paidExpenseSeries = [...paidExpenseBuckets]
+  const cashflowSeries = [...flowBuckets]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([currency, buckets]) => ({
       currency,
       interval: bucketInterval,
       buckets: bucketDates.map((date) => ({
         date,
-        amount: (buckets.get(date) ?? 0) / 100,
+        inflows: paymentHistoryAvailability.customer
+          ? (buckets.inflows.get(date) ?? 0) / 100
+          : null,
+        outflows: paymentHistoryAvailability.expenses
+          ? (buckets.outflows.get(date) ?? 0) / 100
+          : null,
       })),
     }));
 
@@ -274,7 +341,9 @@ export function buildDashboardCockpit(
     overdueCustomerInvoices: overdueCustomerInvoices.sort(sortByDueDate),
     upcomingSupplierInvoices: upcomingSupplierInvoices.sort(sortByDueDate),
     upcomingInvoices: upcomingInvoices.sort(sortByDueDate),
-    paidExpenseSeries,
+    cashflowSeries,
+    customerPaymentTotals: mapTotals(customerPaymentTotals),
+    expensePaymentTotals: mapTotals(expensePaymentTotals),
   };
 }
 
@@ -327,6 +396,22 @@ export function buildDashboardSummary(invoices: InvoiceRecord[], asOfDate: strin
     else addCurrencyTotal(receivableTotals, balanceInvoice);
 
     const dueDay = dateOrdinal(invoice.dueDate);
+    if (status === "overdue") {
+      if (invoice.total === null || !Number.isFinite(invoice.total) || !invoice.currency || !/^[A-Z]{3}$/.test(invoice.currency)) {
+        actions.push({ invoice, kind: "verify", daysUntilDue: null, reason: "Statut En retard; montant ou devise à vérifier" });
+        continue;
+      }
+      addCurrencyTotal(overdueTotals, balanceInvoice);
+      actions.push({
+        invoice,
+        kind: "overdue",
+        daysUntilDue: dueDay !== null && today !== null && dueDay < today ? dueDay - today : null,
+        reason: dueDay !== null && today !== null && dueDay < today
+          ? "Échéance dépassée"
+          : "Statut En retard choisi manuellement; date à vérifier",
+      });
+      continue;
+    }
     if (dueDay === null || today === null) {
       actions.push({ invoice, kind: "verify", daysUntilDue: null, reason: "Date d’échéance absente ou invalide" });
       continue;

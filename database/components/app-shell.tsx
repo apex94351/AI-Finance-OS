@@ -12,6 +12,7 @@ import {
   CreditCard,
   FileText,
   Globe2,
+  Landmark,
   LayoutDashboard,
   Menu,
   Moon,
@@ -44,11 +45,25 @@ interface AppShellProps {
 
 const navigation: { group: keyof typeof messages.fr.groups; items: { key: keyof typeof messages.fr.nav; label?: string; href: string; icon: Icon }[] }[] = [
   { group: "main", items: [{ key: "home", label: "Dashboard", href: "/dashboard", icon: LayoutDashboard }] },
-  { group: "finance", items: [{ key: "invoices", href: "/invoices", icon: ReceiptText }, { key: "expenses", href: "/expenses", icon: CreditCard }, { key: "dueDates", href: "/due-dates", icon: CalendarClock }] },
+  { group: "finance", items: [{ key: "invoices", href: "/invoices", icon: ReceiptText }, { key: "expenses", href: "/expenses", icon: CreditCard }, { key: "treasury", href: "/treasury", icon: Landmark }, { key: "dueDates", href: "/due-dates", icon: CalendarClock }] },
   { group: "company", items: [{ key: "customers", href: "/clients", icon: Users }, { key: "suppliers", href: "/suppliers", icon: Building2 }, { key: "documents", href: "/documents", icon: FileText }] },
   { group: "intelligence", items: [{ key: "aiCfo", href: "/ai-cfo", icon: Sparkles }] },
   { group: "system", items: [{ key: "settings", href: "/settings", icon: Settings }] },
 ];
+const treasuryLabels: Record<Locale, string> = {
+  fr: "Trésorerie",
+  en: "Treasury",
+  es: "Tesorería",
+  pt: "Tesouraria",
+  it: "Tesoreria",
+  de: "Finanzen",
+  zh: "资金管理",
+};
+
+function getNavigationLabel(key: keyof typeof messages.fr.nav, locale: Locale) {
+  if (key === "treasury") return treasuryLabels[locale];
+  return messages[locale].nav[key];
+}
 
 function getInitialTheme(): Theme {
   if (typeof window === "undefined") return "light";
@@ -177,8 +192,8 @@ export function AppShell({ children, pageTitle, userName = "Mon compte", initial
               {!collapsed ? <p className="nav-section-label">{copy.groups[section.group]}</p> : null}
               {section.items.map(({ key, label, href, icon: ItemIcon }) => {
                 const active = pathname === href || (href !== "/dashboard" && pathname.startsWith(`${href}/`));
-                return <Link href={href} key={key} className={`workspace-nav-item ${active ? "is-active" : ""}`} onClick={() => setMobileOpen(false)} title={collapsed ? label ?? copy.nav[key] : undefined}>
-                  <ItemIcon size={18} strokeWidth={active ? 2.1 : 1.8} /><span>{label ?? copy.nav[key]}</span>
+                return <Link href={href} key={key} className={`workspace-nav-item ${active ? "is-active" : ""}`} onClick={() => setMobileOpen(false)} title={collapsed ? label ?? getNavigationLabel(key, locale) : undefined}>
+                  <ItemIcon size={18} strokeWidth={active ? 2.1 : 1.8} /><span>{label ?? getNavigationLabel(key, locale)}</span>
                 </Link>;
               })}
             </div>
@@ -197,7 +212,7 @@ export function AppShell({ children, pageTitle, userName = "Mon compte", initial
 
       <div className={`workspace-main ${collapsed ? "sidebar-collapsed" : ""}`}>
         <header className="workspace-header">
-          <div className="header-left"><button className="icon-button mobile-menu-button" onClick={() => setMobileOpen(true)} aria-label="Ouvrir le menu"><Menu size={20} /></button><span className="header-context">{copy.nav[currentTitle as keyof typeof copy.nav] ?? copy.nav.home}</span></div>
+          <div className="header-left"><button className="icon-button mobile-menu-button" onClick={() => setMobileOpen(true)} aria-label="Ouvrir le menu"><Menu size={20} /></button><span className="header-context">{currentTitle === "treasury" ? treasuryLabels[locale] : copy.nav[currentTitle as keyof typeof copy.nav] ?? copy.nav.home}</span></div>
           <div className="workspace-search"><Search size={17} /><input aria-label={copy.common.search} placeholder={copy.common.search} /><kbd>⌘ K</kbd></div>
           <div className="header-actions">
             <LanguagePicker locale={locale} onChange={changeLocale} />

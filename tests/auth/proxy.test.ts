@@ -19,6 +19,7 @@ describe("protected route proxy", () => {
   it.each([
     ["/dashboard?period=month", "/login?next=%2Fdashboard%3Fperiod%3Dmonth"],
     ["/settings", "/login?next=%2Fsettings"],
+    ["/treasury", "/login?next=%2Ftreasury"],
   ])("redirects unauthenticated requests to %s", async (requestedPath, expectedPath) => {
     const response = await proxy(new NextRequest(`https://finance.example${requestedPath}`));
 

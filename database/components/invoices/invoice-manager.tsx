@@ -14,6 +14,7 @@ import { getEffectiveInvoiceStatus, getInvoiceDirection, getInvoiceDisplayStatus
 import type { ContactRecord, InvoiceCompany, InvoiceDisplayStatus, InvoicePaymentStatus, InvoiceRecord } from "@/types/invoice";
 import { InvoiceForm } from "./invoice-form";
 import { InvoicePaymentForm } from "./invoice-payment-form";
+import { SupplierInvoicePaymentForm } from "./supplier-invoice-payment-form";
 
 type StatusFilter = "all" | InvoiceDisplayStatus;
 export type InvoiceDashboardFilter =
@@ -151,6 +152,7 @@ export function InvoiceManager({
   const [showForm, setShowForm] = useState(Boolean(sourceDocument));
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [payingInvoiceId, setPayingInvoiceId] = useState<string | null>(null);
+  const [payingSupplierInvoiceId, setPayingSupplierInvoiceId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
@@ -172,6 +174,8 @@ export function InvoiceManager({
     () => buildInvoiceOverview(workspaceInvoices, today, companyCurrencies, period),
     [companyCurrencies, period, today, workspaceInvoices],
   );
+  const incompleteAmountCount = overview.customers.incompleteAmountCount + overview.suppliers.incompleteAmountCount;
+  const unclassifiedMoneyValidCount = overview.unclassifiedCount - overview.unclassifiedIncompleteAmountCount;
   const contactNames = useMemo(() => new Map(contacts.map(({ id, name }) => [id, name])), [contacts]);
 
   const visibleInvoices = useMemo(() => {
@@ -230,6 +234,12 @@ export function InvoiceManager({
   }
 
   function handleStatusChange(invoice: InvoiceRecord, targetStatus: InvoicePaymentStatus) {
+    if (targetStatus === "paid" && getInvoiceDirection(invoice) === "supplier") {
+      setStatusError(null);
+      setStatusMessage(null);
+      setPayingSupplierInvoiceId(invoice.id);
+      return;
+    }
     if (updatingIdRef.current) return;
     updatingIdRef.current = invoice.id;
     setUpdatingId(invoice.id);
@@ -256,6 +266,7 @@ export function InvoiceManager({
 
   function handlePaymentSaved() {
     setPayingInvoiceId(null);
+    setPayingSupplierInvoiceId(null);
     router.refresh();
   }
 
@@ -344,9 +355,22 @@ export function InvoiceManager({
           <p className="invoice-overview-note">
             Les indicateurs utilisent la période d’émission sélectionnée. À encaisser, à payer et en retard correspondent aux soldes restant dus ; le solde net des factures compare les montants TTC émis sur la période. Aucune conversion de devise n’est effectuée.
           </p>
-          {overview.customers.incompleteAmountCount + overview.suppliers.incompleteAmountCount + overview.unclassifiedCount > 0 ? (
+          {incompleteAmountCount + overview.unclassifiedCount > 0 ? (
             <p className="invoice-overview-warning" role="status">
-              {overview.customers.incompleteAmountCount + overview.suppliers.incompleteAmountCount + overview.unclassifiedCount} facture{overview.customers.incompleteAmountCount + overview.suppliers.incompleteAmountCount + overview.unclassifiedCount === 1 ? "" : "s"} ne sont pas entièrement totalisée{overview.customers.incompleteAmountCount + overview.suppliers.incompleteAmountCount + overview.unclassifiedCount === 1 ? "" : "s"} : montant/devise inexploitable ou sens financier non confirmé. Utilisez « Modifier » pour vérifier le type sans changer le montant.
+              {incompleteAmountCount > 0
+                ? incompleteAmountCount === 1
+                  ? "1 facture présente un montant, une devise ou un solde restant à vérifier; elle n’est pas incluse dans les totaux concernés. "
+                  : `${incompleteAmountCount} factures présentent un montant, une devise ou un solde restant à vérifier; elles ne sont pas incluses dans les totaux concernés. `
+                : ""}
+              {unclassifiedMoneyValidCount > 0
+                ? `${unclassifiedMoneyValidCount} facture${unclassifiedMoneyValidCount === 1 ? " non classée a" : "s non classées ont"} un montant et une devise exploitables. `
+                : ""}
+              {overview.unclassifiedIncompleteAmountCount > 0
+                ? `Montant ou devise à vérifier pour ${overview.unclassifiedIncompleteAmountCount} facture${overview.unclassifiedIncompleteAmountCount === 1 ? " non classée" : "s non classées"}. `
+                : ""}
+              {overview.unclassifiedCount > 0
+                ? `${overview.unclassifiedCount} facture${overview.unclassifiedCount === 1 ? "" : "s"} a${overview.unclassifiedCount === 1 ? "" : "ont"} un sens financier non confirmé; ${overview.unclassifiedCount === 1 ? "elle reste" : "elles restent"} visible${overview.unclassifiedCount === 1 ? "" : "s"} dans le registre et exclue${overview.unclassifiedCount === 1 ? "" : "s"} des totaux directionnels. Associez un client ou un fournisseur; sans tiers, l’enregistrement du sens nécessite la migration 017.`
+                : ""}
             </p>
           ) : null}
 
@@ -469,6 +493,33 @@ export function InvoiceManager({
               </section>
             );
           })() : null}
+          {payingSupplierInvoiceId ? (() => {
+            const invoice = workspaceInvoices.find(({ id }) => id === payingSupplierInvoiceId);
+            if (!invoice) return null;
+            const paidAmount = invoice.paidAmount;
+            const balance = invoice.total !== null && paidAmount !== null && paidAmount !== undefined
+              ? Math.max(0, Math.round((invoice.total - paidAmount) * 100) / 100)
+              : null;
+            return (
+              <section className="surface-panel invoice-form-panel" aria-labelledby="supplier-invoice-payment-heading">
+                <div className="invoice-form-title">
+                  <div><span className="panel-kicker">Paiement daté</span><h2 id="supplier-invoice-payment-heading">Payer · {invoice.invoiceNumber ?? "Facture fournisseur"}</h2></div>
+                  <button className="text-button" type="button" onClick={() => setPayingSupplierInvoiceId(null)}>Fermer</button>
+                </div>
+                {balance === null
+                  ? <p className="auth-message is-error" role="alert">Le solde restant ou l’historique des paiements fournisseur est indisponible.</p>
+                  : balance <= 0
+                    ? <p className="dashboard-note">Aucun solde restant à payer.</p>
+                    : <SupplierInvoicePaymentForm
+                      companyId={invoice.companyId}
+                      invoiceId={invoice.id}
+                      balance={balance}
+                      today={today}
+                      onSaved={handlePaymentSaved}
+                    />}
+              </section>
+            );
+          })() : null}
         </>
       ) : null}
     </>
@@ -580,6 +631,7 @@ function InvoiceRows({
                   }}
                 >
                   <button type="button" disabled={updating} onClick={() => selectStatus("pending")}>{direction === "customer" ? "Impayée" : "À payer"}</button>
+                  {effectiveStatus === "overdue" ? <button type="button" disabled={updating} onClick={() => selectStatus("overdue")}>En retard</button> : null}
                   {direction !== "customer" ? <button type="button" disabled={updating} onClick={() => selectStatus("paid")}>Payée</button> : null}
                 </div>,
                 document.body,

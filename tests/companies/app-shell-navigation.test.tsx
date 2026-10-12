@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 
 import { createElement, type AnchorHTMLAttributes } from "react";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppShell } from "@/database/components/app-shell";
+import TreasuryPage from "@/app/treasury/page";
 import { messages } from "@/i18n/messages";
 
 const { getPathname } = vi.hoisted(() => ({ getPathname: vi.fn(() => "/dashboard") }));
@@ -31,6 +32,7 @@ const expectedEntries = [
   ["Dashboard", "/dashboard", "main"],
   ["Factures", "/invoices", "finance"],
   ["Dépenses", "/expenses", "finance"],
+  ["Trésorerie", "/treasury", "finance"],
   ["Échéances", "/due-dates", "finance"],
   ["Clients", "/clients", "company"],
   ["Fournisseurs", "/suppliers", "company"],
@@ -42,12 +44,12 @@ const expectedEntries = [
 describe("application sidebar navigation", () => {
   afterEach(cleanup);
 
-  it("renders exactly the nine retained links with existing group labels and real routes", () => {
+  it("renders exactly the ten retained links with existing group labels and real routes", () => {
     render(<AppShell initialLocale="fr" initialTheme="light"><div /></AppShell>);
     const nav = screen.getByRole("navigation", { name: "Navigation de l’application" });
     const links = within(nav).getAllByRole("link");
 
-    expect(links).toHaveLength(9);
+    expect(links).toHaveLength(10);
     expect(links.map((link) => [link.textContent, link.getAttribute("href")])).toEqual(
       expectedEntries.map(([label, href]) => [label, href]),
     );
@@ -78,5 +80,30 @@ describe("application sidebar navigation", () => {
 
     expect(dashboardLink.getAttribute("href")).toBe("/dashboard");
     expect(dashboardLink.className).toContain("is-active");
+  });
+
+  it("exposes Treasury as an active finance destination on mobile navigation", () => {
+    getPathname.mockReturnValue("/treasury");
+    render(<AppShell initialLocale="fr" initialTheme="light"><div /></AppShell>);
+    const nav = screen.getByRole("navigation", { name: "Navigation de l’application" });
+    const treasuryLink = within(nav).getByRole("link", { name: "Trésorerie" });
+    const sidebar = nav.closest(".workspace-sidebar")!;
+
+    expect(treasuryLink.getAttribute("href")).toBe("/treasury");
+    expect(treasuryLink.className).toContain("is-active");
+    fireEvent.click(screen.getByRole("button", { name: "Ouvrir le menu" }));
+    expect(sidebar.className).toContain("is-mobile-open");
+    fireEvent.click(treasuryLink);
+    expect(sidebar.className).not.toContain("is-mobile-open");
+  });
+
+  it("renders the Treasury preparation page without fabricated financial values", () => {
+    getPathname.mockReturnValue("/treasury");
+    render(<TreasuryPage />);
+
+    expect(screen.getByRole("heading", { name: "Trésorerie", level: 1 })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /gestion détaillée de la trésorerie arrive bientôt/ })).toBeTruthy();
+    expect(screen.getByText(/soldes, mouvements bancaires et prévisions/)).toBeTruthy();
+    expect(screen.queryByText(/\d+,\d{2}\s*€/)).toBeNull();
   });
 });

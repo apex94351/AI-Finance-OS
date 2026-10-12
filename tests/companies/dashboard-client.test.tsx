@@ -3,6 +3,7 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DashboardClient } from "@/database/components/dashboard/dashboard-client";
+import DashboardLoading from "@/app/dashboard/loading";
 import type { ExpenseRecord } from "@/services/expenses";
 import type { InvoiceRecord, InvoiceStatus } from "@/types/invoice";
 
@@ -84,20 +85,34 @@ describe("dashboard cockpit", () => {
     expect(expenseCard.textContent).toContain("15,00");
     expect(invoicedCard.getAttribute("href"))
       .toBe("/invoices?dashboardFilter=customer-invoices");
-    expect(screen.getByText(/Les règlements partiels ne sont pas enregistrés/)).toBeTruthy();
+    expect(screen.getByText(/pas des soldes bancaires/)).toBeTruthy();
   });
 
-  it("updates the period-scoped cards and paid-expense chart using real period controls", () => {
+  it("exposes the dashboard loading skeleton as an accessible busy state", () => {
+    render(<DashboardLoading />);
+
+    expect(screen.getByRole("status", { name: "Chargement du tableau de bord" }).getAttribute("aria-busy"))
+      .toBe("true");
+  });
+
+  it("updates the period-scoped cards and recorded-expense chart using real period controls", () => {
     render(
       <DashboardClient
         invoices={[
           invoice("older-issued", { issueDate: "2026-09-15", total: 200 }),
           invoice("recent-issued", { issueDate: "2026-10-10", total: 50 }),
         ]}
+        customerPayments={[
+          { invoiceId: "recent-issued", paymentDate: "2026-10-10", amount: 50 },
+        ]}
         expenses={[
           expense("older", { expenseDate: "2026-09-15", amount: 40 }),
           expense("recent", { expenseDate: "2026-10-10", amount: 12 }),
         ]}
+        expensePayments={[
+          { expenseId: "recent", paymentDate: "2026-10-10", amount: 12 },
+        ]}
+        paymentHistoryAvailability={{ customer: true, expenses: true }}
         loadError={null}
         asOfDate="2026-10-11"
       />,
@@ -105,74 +120,162 @@ describe("dashboard cockpit", () => {
 
     const billed = screen.getByRole("link", { name: /Facturé sur la période.*Factures clients émises/ });
     expect(billed.textContent).toContain("250,00");
-    const chart = screen.getByRole("img", { name: "Dépenses enregistrées comme payées par date" });
-    expect(chart.getAttribute("width")).toBe("720");
-    expect(chart.getAttribute("height")).toBe("220");
-    expect(chart.querySelectorAll(".dashboard-chart-bar")).toHaveLength(2);
-    expect(chart.querySelectorAll(".dashboard-chart-axis")).toHaveLength(12);
+    const chart = screen.getByRole("group", { name: "Graphique interactif des flux en EUR" });
+    expect(chart.getAttribute("viewBox")).toBe("0 0 720 248");
+    expect(chart.querySelectorAll(".dashboard-chart-line path").length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("button", { name: "7 jours" }));
     expect(billed.textContent).toContain("50,00");
     expect(screen.getByRole("button", { name: "7 jours" }).getAttribute("aria-pressed")).toBe("true");
-    expect(chart.querySelectorAll(".dashboard-chart-bar")).toHaveLength(1);
-    expect(chart.querySelectorAll(".dashboard-chart-axis")).toHaveLength(10);
+    expect(screen.getAllByRole("group", { name: "Graphique interactif des flux en EUR" })).toHaveLength(1);
+    expect(screen.getByRole("group", { name: "Graphique interactif des flux en EUR" })
+      .querySelectorAll(".dashboard-chart-axis")).toHaveLength(10);
     fireEvent.click(screen.getByRole("button", { name: "Personnalisée" }));
     fireEvent.change(screen.getByLabelText("Date de début personnalisée"), { target: { value: "2026-10-09" } });
     fireEvent.change(screen.getByLabelText("Date de fin personnalisée"), { target: { value: "2026-10-10" } });
     expect(billed.textContent).toContain("50,00");
-    expect(screen.getByRole("img", { name: "Dépenses enregistrées comme payées par date" })
+    expect(screen.getByRole("group", { name: "Graphique interactif des flux en EUR" })
       .querySelectorAll(".dashboard-chart-axis")).toHaveLength(5);
+    fireEvent.click(screen.getByRole("button", { name: "3 mois" }));
+    expect(screen.getByRole("button", { name: "3 mois" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByRole("group", { name: "Graphique interactif des flux en EUR" })
+      .querySelectorAll(".dashboard-chart-axis").length).toBeGreaterThan(3);
+    fireEvent.click(screen.getByRole("button", { name: "6 mois" }));
+    expect(screen.getByRole("button", { name: "6 mois" }).getAttribute("aria-pressed")).toBe("true");
     fireEvent.click(screen.getByRole("button", { name: "1 an" }));
-    const yearlyChart = screen.getByRole("img", { name: "Dépenses enregistrées comme payées par date" });
+    const yearlyChart = screen.getByRole("group", { name: "Graphique interactif des flux en EUR" });
     expect(yearlyChart.textContent).toContain("25");
     expect(yearlyChart.textContent).toContain("26");
   });
 
-  it("draws positive, in-bounds SVG bars only for paid expenses in the selected month", () => {
+  it("draws distinct currency lines only from dated payment entries", () => {
     render(
       <DashboardClient
         invoices={[]}
         expenses={[
           expense("paid-in-month-one", { expenseDate: "2026-10-10", amount: 12.34 }),
           expense("paid-in-month-two", { expenseDate: "2026-10-10", amount: 7.66 }),
-          expense("paid-at-month-start", { expenseDate: "2026-09-11", amount: 5 }),
-          expense("paid-before-month", { expenseDate: "2026-09-10", amount: 90 }),
+          expense("paid-at-month-start", { expenseDate: "2026-09-15", amount: 5 }),
+          expense("paid-before-month", { expenseDate: "2026-09-11", amount: 90 }),
           expense("paid-after-month", { expenseDate: "2026-10-12", amount: 80 }),
           expense("pending-in-month", { status: "pending", expenseDate: "2026-10-09", amount: 70 }),
           expense("paid-usd-in-month", { expenseDate: "2026-10-11", amount: 4, currency: "USD" }),
         ]}
+        expensePayments={[
+          { expenseId: "paid-in-month-one", paymentDate: "2026-10-10", amount: 12.34 },
+          { expenseId: "paid-in-month-two", paymentDate: "2026-10-10", amount: 7.66 },
+          { expenseId: "paid-at-month-start", paymentDate: "2026-09-15", amount: 5 },
+          { expenseId: "paid-usd-in-month", paymentDate: "2026-10-11", amount: 4 },
+          { expenseId: "pending-in-month", paymentDate: "2026-10-09", amount: 20 },
+        ]}
+        paymentHistoryAvailability={{ customer: true, expenses: true }}
         loadError={null}
         asOfDate="2026-10-11"
       />,
     );
 
-    const charts = screen.getAllByRole("img", { name: "Dépenses enregistrées comme payées par date" });
+    const charts = screen.getAllByRole("group", { name: /Graphique interactif des flux en/ });
     expect(charts).toHaveLength(2);
     const eurChart = charts.find((chart) => chart.closest(".dashboard-chart-series")?.querySelector("h3")?.textContent === "EUR");
     const usdChart = charts.find((chart) => chart.closest(".dashboard-chart-series")?.querySelector("h3")?.textContent === "USD");
     expect(eurChart).toBeTruthy();
     expect(usdChart).toBeTruthy();
 
-    const eurBars = [...eurChart!.querySelectorAll<SVGRectElement>(".dashboard-chart-bar")];
-    expect(eurBars).toHaveLength(2);
-    const aggregatedBar = eurBars.find((bar) => bar.querySelector("title")?.textContent.includes("20,00"));
-    expect(aggregatedBar).toBeTruthy();
-
-    for (const bar of [...eurBars, ...usdChart!.querySelectorAll<SVGRectElement>(".dashboard-chart-bar")]) {
-      const x = Number(bar.getAttribute("x"));
-      const y = Number(bar.getAttribute("y"));
-      const width = Number(bar.getAttribute("width"));
-      const height = Number(bar.getAttribute("height"));
-      expect(Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(width) && Number.isFinite(height)).toBe(true);
-      expect(width).toBeGreaterThan(0);
-      expect(height).toBeGreaterThan(0);
-      expect(x).toBeGreaterThanOrEqual(0);
-      expect(x + width).toBeLessThanOrEqual(720);
-      expect(y).toBeGreaterThanOrEqual(16);
-      expect(y + height).toBeLessThanOrEqual(180);
-    }
+    expect(eurChart!.querySelectorAll(".dashboard-chart-line.outflows path").length).toBeGreaterThan(0);
+    expect(eurChart!.querySelectorAll(".dashboard-chart-hit-target")).toHaveLength(60);
+    expect(usdChart!.querySelectorAll(".dashboard-chart-hit-target")).toHaveLength(60);
+    expect(eurChart!.querySelectorAll(".dashboard-chart-point")).toHaveLength(0);
+    expect(screen.getAllByRole("button", { name: /Dépenses payées.*2026/ }).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("button", { name: /non payé/ })).toBeNull();
   });
 
-  it("renders separate currency charts and an explicit empty state without confusing it with load errors", () => {
+  it("selects the nearest line precisely, exposes its own value, and clears the tooltip on exit", () => {
+    render(
+      <DashboardClient
+        invoices={[invoice("nearby-customer")]}
+        customerPayments={[
+          { invoiceId: "nearby-customer", paymentDate: "2026-10-10", amount: 10 },
+        ]}
+        expenses={[expense("nearby-expense", { status: "pending" })]}
+        expensePayments={[
+          { expenseId: "nearby-expense", paymentDate: "2026-10-10", amount: 9.5 },
+        ]}
+        paymentHistoryAvailability={{ customer: true, expenses: true }}
+        loadError={null}
+        asOfDate="2026-10-11"
+      />,
+    );
+
+    const chart = screen.getByRole("group", { name: "Graphique interactif des flux en EUR" });
+    Object.defineProperty(chart, "getBoundingClientRect", {
+      value: () => ({ x: 0, y: 0, left: 0, top: 0, right: 720, bottom: 248, width: 720, height: 248, toJSON: () => ({}) }),
+    });
+    const incomingPoint = [...chart.querySelectorAll<SVGCircleElement>(".dashboard-chart-line.inflows circle")]
+      .find((point) => point.getAttribute("aria-label")?.includes("10,00"));
+    const outgoingPoint = [...chart.querySelectorAll<SVGCircleElement>(".dashboard-chart-line.outflows circle")]
+      .find((point) => point.getAttribute("aria-label")?.includes("9,50"));
+    expect(incomingPoint).toBeTruthy();
+    expect(outgoingPoint).toBeTruthy();
+
+    fireEvent.pointerMove(chart, {
+      clientX: Number(outgoingPoint!.getAttribute("cx")),
+      clientY: Number(outgoingPoint!.getAttribute("cy")),
+    });
+    expect(screen.getByRole("status").textContent).toContain("Dépenses payées");
+    expect(screen.getByRole("status").textContent).toContain("9,50");
+    expect(chart.querySelector(".dashboard-chart-line.outflows")?.classList.contains("is-active")).toBe(true);
+    expect(chart.querySelector(".dashboard-chart-crosshair")?.getAttribute("x1"))
+      .toBe(outgoingPoint!.getAttribute("cx"));
+
+    fireEvent.pointerMove(chart, {
+      clientX: Number(incomingPoint!.getAttribute("cx")),
+      clientY: Number(incomingPoint!.getAttribute("cy")),
+    });
+    expect(screen.getByRole("status").textContent).toContain("Entrées clients");
+    expect(screen.getByRole("status").textContent).toContain("10,00");
+
+    fireEvent.pointerLeave(chart);
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(chart.querySelector(".dashboard-chart-crosshair")).toBeNull();
+  });
+
+  it("supports selecting points with the keyboard and toggling chart lines from the legend", () => {
+    render(
+      <DashboardClient
+        invoices={[invoice("keyboard-client")]}
+        customerPayments={[
+          { invoiceId: "keyboard-client", paymentDate: "2026-10-10", amount: 30 },
+        ]}
+        expenses={[expense("keyboard-expense")]}
+        expensePayments={[
+          { expenseId: "keyboard-expense", paymentDate: "2026-10-10", amount: 15 },
+        ]}
+        paymentHistoryAvailability={{ customer: true, expenses: true }}
+        loadError={null}
+        asOfDate="2026-10-11"
+      />,
+    );
+    const chart = screen.getByRole("group", { name: "Graphique interactif des flux en EUR" });
+    const incomingPoint = [...chart.querySelectorAll<SVGCircleElement>(".dashboard-chart-line.inflows circle")]
+      .find((point) => point.getAttribute("aria-label")?.includes("30,00"));
+
+    fireEvent.focus(incomingPoint!);
+    expect(screen.getByRole("status").textContent).toContain("Entrées clients");
+    expect(screen.getByRole("status").textContent).toContain("30,00");
+    fireEvent.keyDown(incomingPoint!, { key: "ArrowDown" });
+    expect(screen.getByRole("status").textContent).toContain("Dépenses payées");
+    expect(screen.getByRole("status").textContent).toContain("15,00");
+
+    const expenseLegend = within(document.querySelector(".dashboard-chart-legend")!)
+      .getByRole("button", { name: /Dépenses payées/ });
+    fireEvent.click(expenseLegend);
+    expect(expenseLegend.getAttribute("aria-pressed")).toBe("false");
+    expect(chart.querySelector(".dashboard-chart-line.outflows")).toBeNull();
+    fireEvent.click(expenseLegend);
+    expect(expenseLegend.getAttribute("aria-pressed")).toBe("true");
+    expect(chart.querySelector(".dashboard-chart-line.outflows")).toBeTruthy();
+  });
+
+  it("renders currency-separated payment charts and distinguishes empty data from unavailable journals", () => {
     const { rerender } = render(
       <DashboardClient
         invoices={[]}
@@ -180,28 +283,40 @@ describe("dashboard cockpit", () => {
           expense("eur", { amount: 15 }),
           expense("usd", { amount: 8, currency: "USD" }),
         ]}
+        expensePayments={[
+          { expenseId: "eur", paymentDate: "2026-10-10", amount: 15 },
+          { expenseId: "usd", paymentDate: "2026-10-10", amount: 8 },
+        ]}
+        paymentHistoryAvailability={{ customer: true, expenses: true }}
         loadError={null}
         asOfDate="2026-10-11"
       />,
     );
 
-    expect(screen.getAllByRole("img", { name: "Dépenses enregistrées comme payées par date" })).toHaveLength(2);
+    expect(screen.getAllByRole("group", { name: /Graphique interactif des flux en/ })).toHaveLength(2);
     expect(screen.getByText("EUR")).toBeTruthy();
     expect(screen.getByText("USD")).toBeTruthy();
-
-    rerender(<DashboardClient invoices={[]} expenses={[]} loadError={null} asOfDate="2026-10-11" />);
-    expect(screen.getByText(/Aucune dépense marquée comme payée sur cette période/)).toBeTruthy();
-    expect(screen.queryByRole("img", { name: "Dépenses enregistrées comme payées par date" })).toBeNull();
 
     rerender(<DashboardClient
       invoices={[]}
       expenses={[]}
+      paymentHistoryAvailability={{ customer: true, expenses: true }}
+      loadError={null}
+      asOfDate="2026-10-11"
+    />);
+    expect(screen.getByText(/Aucun paiement client ni paiement de dépense enregistré/)).toBeTruthy();
+    expect(screen.queryByRole("group", { name: /Graphique interactif des flux en/ })).toBeNull();
+
+    rerender(<DashboardClient
+      invoices={[]}
+      expenses={[]}
+      paymentHistoryAvailability={{ customer: false, expenses: false }}
       expensesLoadError="Erreur de chargement explicite."
       loadError={null}
       asOfDate="2026-10-11"
     />);
     expect(screen.getByRole("alert").textContent).toContain("Erreur de chargement explicite.");
-    expect(screen.queryByText(/Aucune dépense marquée comme payée/)).toBeNull();
+    expect(screen.queryByText(/Aucun paiement client ni paiement de dépense enregistré/)).toBeNull();
   });
 
   it("shows priority and due items with links to filtered lists and invoice details", () => {
@@ -265,7 +380,7 @@ describe("dashboard cockpit", () => {
 
     expect(screen.getByText(/son état de vérification n’est pas enregistré/)).toBeTruthy();
     expect(screen.getByRole("alert").textContent).toContain("dépenses");
-    expect(screen.getByText(/Aucun journal de règlements clients\/fournisseurs ni solde initial bancaire/)).toBeTruthy();
+    expect(screen.getByText(/aucune connexion bancaire ni solde initial vérifié/)).toBeTruthy();
     expect(screen.getByText(/Aucune facture en retard/)).toBeTruthy();
   });
 

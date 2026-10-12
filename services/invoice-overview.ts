@@ -25,6 +25,7 @@ export interface InvoiceOverview {
   overdue: InvoiceCurrencyTotal[];
   net: InvoiceCurrencyTotal[];
   unclassifiedCount: number;
+  unclassifiedIncompleteAmountCount: number;
 }
 
 function validDate(value: string | null): value is string {
@@ -76,6 +77,7 @@ export function buildInvoiceOverview(
   const suppliers = createPartyTotals();
   const isAsOfDateValid = validDate(asOfDate);
   let unclassifiedCount = 0;
+  let unclassifiedIncompleteAmountCount = 0;
 
   for (const invoice of invoices) {
     const issueDate = invoice.issueDate;
@@ -87,18 +89,19 @@ export function buildInvoiceOverview(
     const status = getEffectiveInvoiceStatus(invoice.status, invoice.dueDate, new Date(`${asOfDate}T00:00:00Z`));
     if (status === "draft" || status === "cancelled") continue;
 
-    const direction = getInvoiceDirection(invoice);
-    const partyTotals = direction === "supplier" ? suppliers : direction === "customer" ? customers : null;
-    if (!partyTotals) {
-      unclassifiedCount += 1;
-      continue;
-    }
-
     const currencyCandidate = invoice.currency ?? companyCurrencies.get(invoice.companyId ?? "") ?? null;
     const currency = currencyCandidate && /^[A-Z]{3}$/.test(currencyCandidate) ? currencyCandidate : null;
     const amount = invoice.total !== null && Number.isFinite(invoice.total) && invoice.total >= 0
       ? invoice.total
       : null;
+    const direction = getInvoiceDirection(invoice);
+    const partyTotals = direction === "supplier" ? suppliers : direction === "customer" ? customers : null;
+    if (!partyTotals) {
+      unclassifiedCount += 1;
+      if (amount === null || currency === null) unclassifiedIncompleteAmountCount += 1;
+      continue;
+    }
+
     if (amount === null || currency === null) partyTotals.incompleteAmountCount += 1;
     if (amount !== null && currency !== null) addAmount(partyTotals.issued, amount, currency);
 
@@ -127,10 +130,7 @@ export function buildInvoiceOverview(
       addAmount(partyTotals.outstanding, remaining, currency);
     }
 
-    const isOverdue = isAsOfDateValid
-      && validDate(invoice.dueDate)
-      && invoice.dueDate < asOfDate
-      && hasOutstandingBalance;
+    const isOverdue = status === "overdue" && hasOutstandingBalance;
     if (isOverdue) {
       partyTotals.overdueCount += 1;
       if (remaining !== null && remaining > 0 && currency !== null) {
@@ -179,5 +179,6 @@ export function buildInvoiceOverview(
     overdue: mapTotals(overdueCents),
     net: mapTotals(netCents),
     unclassifiedCount,
+    unclassifiedIncompleteAmountCount,
   };
 }

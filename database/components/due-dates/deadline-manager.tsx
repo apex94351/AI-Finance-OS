@@ -45,7 +45,8 @@ function formatDate(value: string) {
   }).format(new Date(Date.UTC(year, month - 1, day)));
 }
 
-function dueText(days: number) {
+function dueText(days: number, manuallyOverdue = false) {
+  if (manuallyOverdue && days >= 0) return "Statut En retard choisi manuellement";
   if (days === 0) return "Échéance aujourd’hui";
   if (days > 0) return `Dans ${days} jour${days === 1 ? "" : "s"}`;
   const lateDays = Math.abs(days);
@@ -62,7 +63,7 @@ export function DeadlineManager({
   const [filter, setFilter] = useState<DueDateFilter>("all");
   const [search, setSearch] = useState("");
   const items = useMemo(() => buildDueDateItems(invoices, asOfDate), [asOfDate, invoices]);
-  const summary = useMemo(() => buildDueDateSummary(invoices), [invoices]);
+  const summary = useMemo(() => buildDueDateSummary(invoices, asOfDate), [asOfDate, invoices]);
   const forecastTone = Math.abs(summary.forecastBalance) <= 0.01
     ? ""
     : summary.forecastBalance > 0 ? "is-positive" : "is-negative";
@@ -122,7 +123,7 @@ export function DeadlineManager({
                 ? `${summary.incompleteAmountCount} obligation${summary.incompleteAmountCount === 1 ? "" : "s"} avec un montant ou une devise inexploitable ne sont pas incluses dans les totaux.`
                 : ""}
               {summary.unclassifiedCount > 0
-                ? `${summary.unclassifiedCount} facture${summary.unclassifiedCount === 1 ? "" : "s"} sans sens financier confirmé reste${summary.unclassifiedCount === 1 ? "" : "nt"} visible${summary.unclassifiedCount === 1 ? "" : "s"} dans « Toutes » et n’est pas incluse dans les totaux.`
+                ? `${summary.unclassifiedCount} facture${summary.unclassifiedCount === 1 ? "" : "s"} sans sens financier confirmé reste${summary.unclassifiedCount === 1 ? "" : "nt"} visible${summary.unclassifiedCount === 1 ? "" : "s"} dans « Toutes » et n’est pas incluse dans les totaux. Associez-la à un client ou un fournisseur pour la qualifier ; l’enregistrement d’un type sans tiers nécessite la migration 017.`
                 : ""}
             </p>
           ) : null}
@@ -194,7 +195,7 @@ export function DeadlineManager({
                       </div>
                       <div className="deadline-item-meta">
                         <span><CalendarClock size={15} /> Échéance : {formatDate(item.dueDate ?? "")}</span>
-                        <span className={isOverdue ? "deadline-day-count is-overdue" : "deadline-day-count"}>{dueText(item.daysUntilDue)}</span>
+                        <span className={isOverdue ? "deadline-day-count is-overdue" : "deadline-day-count"}>{dueText(item.daysUntilDue, isOverdue)}</span>
                         <Badge tone={isOverdue ? "danger" : item.direction === "unclassified" ? "neutral" : "warning"}>
                           {isOverdue ? "En retard" : item.direction === "payable" ? "À payer" : item.direction === "receivable" ? "À encaisser" : "Sens à préciser"}
                         </Badge>

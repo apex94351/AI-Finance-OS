@@ -2,7 +2,7 @@ import { z } from "zod";
 import { AppShell } from "@/database/components/app-shell";
 import { DeadlineManager } from "@/database/components/due-dates/deadline-manager";
 import { getAuthenticatedSupabase } from "@/lib/supabase/server";
-import { getVerifiedInvoiceSourceDocumentCategory } from "@/services/invoice-validation";
+import { getInvoiceDirection, getVerifiedInvoiceSourceDocumentCategory } from "@/services/invoice-validation";
 import type { DueDateRecord } from "@/services/due-dates";
 
 const membershipSchema = z.array(z.object({ company_id: z.uuid() }));
@@ -330,11 +330,11 @@ export default async function DueDatesPage() {
     grossTotal: invoice.total,
     paidAmount: invoice.status === "paid"
       ? invoice.total ?? 0
-      : invoice.invoiceType === "customer"
+      : getInvoiceDirection(invoice) === "customer"
         ? customerPaymentSchemaUnavailable || customerPaymentDataAvailable
           ? paidByInvoice.get(invoice.id) ?? 0
           : null
-        : invoice.invoiceType === "supplier" || invoice.supplierId
+        : getInvoiceDirection(invoice) === "supplier"
           ? !expenseRowsAvailable || linkedInvoiceIds.has(invoice.id) && !expensePaymentsAvailable
             ? linkedExpensePayments.get(invoice.id) ?? null
             : linkedExpensePayments.get(invoice.id) ?? 0

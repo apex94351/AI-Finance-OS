@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildAnnualExpenseSeries,
+  buildCurrentMonthRecurringExpenseTotals,
   buildExpenseFinancialSummary,
   buildMonthlyExpenseSeries,
   expenseInputSchema,
@@ -10,6 +11,7 @@ import {
   sumExpensesByCurrency,
   type ExpensePaymentRecord,
   type ExpenseRecord,
+  type RecurringExpenseRecord,
 } from "@/services/expenses";
 
 const validInput = {
@@ -46,6 +48,35 @@ const records: ExpenseRecord[] = [
     status: "cancelled", notes: null, createdAt: "", updatedAt: "",
   },
 ];
+
+function recurring(id: string, overrides: Partial<RecurringExpenseRecord> = {}): RecurringExpenseRecord {
+  return {
+    id,
+    userId: "u1",
+    companyId: null,
+    label: `Récurrence ${id}`,
+    amount: 30,
+    currency: "EUR",
+    subtotalHt: null,
+    vatRate: null,
+    vatAmount: null,
+    supplierId: null,
+    supplierName: null,
+    documentId: null,
+    documentName: null,
+    category: "Logiciel",
+    frequency: "monthly",
+    startDate: "2026-01-15",
+    nextDueDate: "2026-10-15",
+    endDate: null,
+    status: "active",
+    pausedOn: null,
+    notes: null,
+    createdAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-01T00:00:00Z",
+    ...overrides,
+  };
+}
 
 describe("expense validation and registry operations", () => {
   it("requires a positive finite amount and normalizes currency", () => {
@@ -104,6 +135,64 @@ describe("expense validation and registry operations", () => {
     expect(summary.payable.get("EUR")).toBe(80);
     expect(summary.overdue.get("EUR")).toBe(75);
     expect(summary.paidThisMonth.get("EUR")).toBe(25);
+    expect(summary.incompleteBalanceCount).toBe(0);
+  });
+
+  it("attributes a linked supplier invoice expense to the actual payment month, not the invoice date", () => {
+    const invoiceExpense: ExpenseRecord = {
+      ...records[0]!,
+      id: "supplier-expense-linked",
+      label: "Facture fournisseur FOU-7",
+      amount: 120,
+      expenseDate: "2026-09-28",
+      dueDate: "2026-10-05",
+      invoiceId: "supplier-invoice-7",
+      status: "paid",
+      paidAmount: 120,
+    };
+    const summary = buildExpenseFinancialSummary([invoiceExpense], [{
+      id: "supplier-payment",
+      expenseId: invoiceExpense.id,
+      paymentDate: "2026-10-08",
+      amount: 120,
+      createdAt: "2026-10-08T10:00:00Z",
+    }], 2026, 10, "2026-10-12");
+
+    expect(summary.monthSpend.size).toBe(0);
+    expect(summary.paidThisMonth.get("EUR")).toBe(120);
+  });
+
+  it("counts a partial supplier invoice payment only once and leaves the unpaid remainder payable", () => {
+    const linkedExpense: ExpenseRecord = {
+      ...records[0]!,
+      id: "supplier-partial-expense",
+      amount: 120,
+      expenseDate: "2026-09-28",
+      invoiceId: "supplier-partial-invoice",
+      paidAmount: 40,
+      status: "pending",
+    };
+    const payment: ExpensePaymentRecord = {
+      id: "supplier-partial-payment",
+      expenseId: linkedExpense.id,
+      paymentDate: "2026-10-08",
+      amount: 40,
+      createdAt: "2026-10-08T10:00:00Z",
+    };
+    const summary = buildExpenseFinancialSummary([linkedExpense], [payment], 2026, 10, "2026-10-12");
+
+    expect(summary.paidThisMonth.get("EUR")).toBe(40);
+    expect(summary.payable.get("EUR")).toBe(80);
+  });
+
+  it("excludes an unknown payment balance instead of treating an unavailable ledger as unpaid", () => {
+    const summary = buildExpenseFinancialSummary([
+      { ...records[0]!, id: "unknown-balance", amount: 100, paidAmount: null, status: "pending" },
+    ], [], 2026, 10, "2026-10-10");
+
+    expect(summary.payable.size).toBe(0);
+    expect(summary.overdue.size).toBe(0);
+    expect(summary.incompleteBalanceCount).toBe(1);
   });
 
   it("builds actual monthly and annual chart periods and leaves future months empty", () => {
@@ -120,5 +209,41 @@ describe("expense validation and registry operations", () => {
     expect(normalizeRecurringMonthlyCost(300, "quarterly")).toBe(100);
     expect(normalizeRecurringMonthlyCost(1200, "yearly")).toBe(100);
     expect(normalizeRecurringMonthlyCost(30, "monthly")).toBe(30);
+  });
+
+  it("plans only active occurrences inside the current month and respects quarterly anchors and end dates", () => {
+    const totals = buildCurrentMonthRecurringExpenseTotals([
+      recurring("quarterly", {
+        amount: 120,
+        frequency: "quarterly",
+        startDate: "2026-01-31",
+        nextDueDate: "2026-10-31",
+      }),
+      recurring("monthly-ended", {
+        amount: 50,
+        startDate: "2026-09-30",
+        nextDueDate: "2026-10-30",
+        endDate: "2026-10-20",
+      }),
+      recurring("paused", { status: "paused", amount: 80 }),
+      recurring("next-month", { nextDueDate: "2026-11-15", amount: 90 }),
+    ], [], "2026-10-11");
+
+    expect([...totals]).toEqual([["EUR", 120]]);
+  });
+
+  it("deduplicates materialized occurrences and includes weekly dates only through this month", () => {
+    const totals = buildCurrentMonthRecurringExpenseTotals([
+      recurring("weekly", {
+        amount: 25,
+        frequency: "weekly",
+        startDate: "2026-10-07",
+        nextDueDate: "2026-10-07",
+      }),
+    ], [
+      { ...records[0]!, id: "occurrence", recurrenceId: "weekly", recurrenceDate: "2026-10-14", expenseDate: "2026-10-14" },
+    ], "2026-10-11");
+
+    expect([...totals]).toEqual([["EUR", 75]]);
   });
 });

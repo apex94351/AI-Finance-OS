@@ -54,6 +54,7 @@ describe("invoice overview", () => {
       overdue: [],
       net: [],
       unclassifiedCount: 0,
+      unclassifiedIncompleteAmountCount: 0,
     });
   });
 
@@ -150,6 +151,31 @@ describe("invoice overview", () => {
       { currency: "CHF", amount: 12 },
     ]);
     expect(result.unclassifiedCount).toBe(1);
+    expect(result.unclassifiedIncompleteAmountCount).toBe(0);
+  });
+
+  it("validates an unclassified invoice amount and currency independently of its direction", () => {
+    const result = buildInvoiceOverview([
+      invoice("valid-unclassified", {
+        customerId: null,
+        supplierId: null,
+        invoiceType: null,
+        total: 120,
+        currency: "EUR",
+      }),
+      invoice("invalid-unclassified", {
+        customerId: null,
+        supplierId: null,
+        invoiceType: null,
+        total: null,
+        currency: "EURO",
+      }),
+    ], "2026-10-11");
+
+    expect(result.unclassifiedCount).toBe(2);
+    expect(result.unclassifiedIncompleteAmountCount).toBe(1);
+    expect(result.customers.issued).toEqual([]);
+    expect(result.suppliers.issued).toEqual([]);
   });
 
   it("does not count invalid dates as overdue", () => {
@@ -205,7 +231,8 @@ describe("invoice overview", () => {
     ], "2026-10-11");
 
     expect(result.customers.outstanding).toEqual([{ currency: "EUR", amount: 240 }]);
-    expect(result.customers.overdue).toEqual([{ currency: "EUR", amount: 120 }]);
+    expect(result.customers.overdue).toEqual([{ currency: "EUR", amount: 240 }]);
+    expect(result.customers.overdueCount).toBe(2);
     expect(result.net).toEqual([{ currency: "EUR", amount: 240 }]);
   });
 });

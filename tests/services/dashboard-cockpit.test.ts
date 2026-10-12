@@ -87,7 +87,7 @@ describe("financial dashboard cockpit", () => {
     expect(result.receivableTotals).toEqual([{ currency: "EUR", amount: 40 }]);
   });
 
-  it("uses expense date and status, excludes cancelled expenses, and keeps currencies separate", () => {
+  it("keeps recorded expense totals separate from cash movements and excludes cancelled expenses", () => {
     const result = buildDashboardCockpit([], [
       expense("paid-eur", { status: "paid", amount: 12.5 }),
       expense("pending-usd", { currency: "USD", amount: 20 }),
@@ -99,80 +99,53 @@ describe("financial dashboard cockpit", () => {
       { currency: "EUR", amount: 12.5 },
       { currency: "USD", amount: 20 },
     ]);
-    const dailyBuckets = result.paidExpenseSeries[0]?.buckets ?? [];
-    expect(dailyBuckets).toHaveLength(31);
-    expect(dailyBuckets[0]).toEqual({ date: "2026-09-11", amount: 0 });
-    expect(dailyBuckets[28]).toEqual({ date: "2026-10-09", amount: 12.5 });
-    expect(dailyBuckets.at(-1)).toEqual({ date: "2026-10-11", amount: 0 });
+    expect(result.cashflowSeries).toEqual([]);
   });
 
-  it("groups only valid paid expenses inside the inclusive one-month range", () => {
+  it("plots only dated client receipts and expense payments, without counting linked supplier invoices twice", () => {
     const range = resolveDashboardDateRange("1m", asOfDate);
-    const result = buildDashboardCockpit([], [
-      expense("paid-in-range-first", {
-        status: "paid",
-        expenseDate: "2026-09-11",
-        amount: 5,
-      }),
-      expense("paid-in-range-eur-one", {
-        status: "paid",
-        expenseDate: "2026-10-10",
-        amount: 12.34,
-      }),
-      expense("paid-in-range-eur-two", {
-        status: "paid",
-        expenseDate: "2026-10-10",
-        amount: 7.66,
-      }),
-      expense("paid-in-range-usd", {
-        status: "paid",
-        expenseDate: "2026-10-11",
-        amount: 4,
-        currency: "USD",
-      }),
-      expense("paid-before-range", {
-        status: "paid",
-        expenseDate: "2026-09-10",
-        amount: 90,
-      }),
-      expense("paid-after-range", {
-        status: "paid",
-        expenseDate: "2026-10-12",
-        amount: 80,
-      }),
-      expense("pending-in-range", {
-        status: "pending",
-        expenseDate: "2026-10-09",
-        amount: 70,
-      }),
-    ], range, asOfDate);
+    const result = buildDashboardCockpit(
+      [
+        invoice("customer-open"),
+        invoice("customer-legacy-paid", { status: "paid" }),
+        invoice("supplier-invoice", { invoiceType: "supplier", customerId: null, supplierId: "supplier", status: "paid" }),
+        invoice("cancelled-customer", { status: "cancelled" }),
+      ],
+      [
+        expense("linked-supplier-payment", { status: "paid", invoiceId: "supplier-invoice" }),
+        expense("pending-partial", { status: "pending" }),
+        expense("paid-without-date", { status: "paid" }),
+        expense("cancelled-payment", { status: "cancelled" }),
+      ],
+      range,
+      asOfDate,
+      [
+        { invoiceId: "customer-open", paymentDate: "2026-09-15", amount: 25 },
+        { invoiceId: "supplier-invoice", paymentDate: "2026-10-10", amount: 90 },
+        { invoiceId: "cancelled-customer", paymentDate: "2026-10-10", amount: 80 },
+      ],
+      [
+        { expenseId: "linked-supplier-payment", paymentDate: "2026-10-10", amount: 35 },
+        { expenseId: "pending-partial", paymentDate: "2026-10-09", amount: 12.34 },
+        { expenseId: "pending-partial", paymentDate: "2026-10-09", amount: 7.66 },
+        { expenseId: "cancelled-payment", paymentDate: "2026-10-10", amount: 88 },
+      ],
+    );
 
     expect(range).toEqual({
-      startDate: "2026-09-11",
+      startDate: "2026-09-12",
       endDate: "2026-10-11",
       valid: true,
     });
-    expect(result.paidExpenseSeries).toEqual([
-      {
-        currency: "EUR",
-        interval: "day",
-        buckets: expect.arrayContaining([
-          { date: "2026-09-11", amount: 5 },
-          { date: "2026-10-10", amount: 20 },
-        ]),
-      },
-      {
-        currency: "USD",
-        interval: "day",
-        buckets: expect.arrayContaining([
-          { date: "2026-10-11", amount: 4 },
-        ]),
-      },
-    ]);
-    expect(result.paidExpenseSeries[0]?.buckets).toHaveLength(31);
-    expect(result.paidExpenseSeries[0]?.buckets.find(({ date }) => date === "2026-09-11")?.amount).toBeGreaterThan(0);
-    expect(result.paidExpenseSeries[0]?.buckets.find(({ date }) => date === "2026-10-10")?.amount).toBe(20);
-    expect(result.paidExpenseSeries[0]?.buckets.some(({ date }) => date === "2026-09-10" || date === "2026-10-12")).toBe(false);
+    expect(result.customerPaymentTotals).toEqual([{ currency: "EUR", amount: 25 }]);
+    expect(result.expensePaymentTotals).toEqual([{ currency: "EUR", amount: 55 }]);
+    expect(result.cashflowSeries).toHaveLength(1);
+    expect(result.cashflowSeries[0]?.buckets).toHaveLength(30);
+    expect(result.cashflowSeries[0]?.buckets.find(({ date }) => date === "2026-09-15")?.inflows).toBe(25);
+    expect(result.cashflowSeries[0]?.buckets.find(({ date }) => date === "2026-10-10")?.inflows).toBe(0);
+    expect(result.cashflowSeries[0]?.buckets.find(({ date }) => date === "2026-10-09")?.outflows).toBe(20);
+    expect(result.cashflowSeries[0]?.buckets.find(({ date }) => date === "2026-10-10")?.outflows).toBe(35);
+    expect(result.cashflowSeries[0]?.buckets.some(({ date }) => date === "2026-09-11" || date === "2026-10-12")).toBe(false);
   });
 
   it("returns overdue customer invoices and sorted upcoming supplier and mixed due items without settled invoices", () => {
@@ -200,7 +173,7 @@ describe("financial dashboard cockpit", () => {
     expect(resolveDashboardDateRange("custom", asOfDate, "2026-10-10", "2026-10-01").valid).toBe(false);
   });
 
-  it("keeps chronological zero-value buckets and inclusive range boundaries for a 7-day period", () => {
+  it("aggregates recorded payment amounts into chronological 7-day buckets and excludes out-of-range dates", () => {
     const range = resolveDashboardDateRange("7d", asOfDate);
     const result = buildDashboardCockpit([], [
       expense("first-day", { status: "paid", expenseDate: "2026-10-05", amount: 10 }),
@@ -209,38 +182,66 @@ describe("financial dashboard cockpit", () => {
       expense("invalid-date", { status: "paid", expenseDate: "2026-02-30", amount: 50 }),
       expense("invalid-amount", { status: "paid", amount: Number.NaN }),
       expense("invalid-currency", { status: "paid", currency: "EURO" }),
-    ], range, asOfDate);
+    ], range, asOfDate, [], [
+      { expenseId: "first-day", paymentDate: "2026-10-05", amount: 10 },
+      { expenseId: "last-day", paymentDate: "2026-10-11", amount: 30 },
+      { expenseId: "before-range", paymentDate: "2026-10-04", amount: 100 },
+      { expenseId: "invalid-date", paymentDate: "2026-02-30", amount: 50 },
+      { expenseId: "invalid-amount", paymentDate: "2026-10-08", amount: Number.NaN },
+      { expenseId: "invalid-currency", paymentDate: "2026-10-08", amount: 20 },
+    ]);
 
-    expect(result.paidExpenseSeries).toEqual([{
+    expect(result.cashflowSeries).toEqual([{
       currency: "EUR",
       interval: "day",
       buckets: [
-        { date: "2026-10-05", amount: 10 },
-        { date: "2026-10-06", amount: 0 },
-        { date: "2026-10-07", amount: 0 },
-        { date: "2026-10-08", amount: 0 },
-        { date: "2026-10-09", amount: 0 },
-        { date: "2026-10-10", amount: 0 },
-        { date: "2026-10-11", amount: 30 },
+        { date: "2026-10-05", inflows: 0, outflows: 10 },
+        { date: "2026-10-06", inflows: 0, outflows: 0 },
+        { date: "2026-10-07", inflows: 0, outflows: 0 },
+        { date: "2026-10-08", inflows: 0, outflows: 0 },
+        { date: "2026-10-09", inflows: 0, outflows: 0 },
+        { date: "2026-10-10", inflows: 0, outflows: 0 },
+        { date: "2026-10-11", inflows: 0, outflows: 30 },
       ],
     }]);
   });
 
-  it("creates separate, chronologically ordered monthly series for a year and each currency", () => {
+  it("creates chronologically ordered currency-separated flow series for a year", () => {
     const result = buildDashboardCockpit([], [
       expense("eur-later", { status: "paid", expenseDate: "2026-10-11", amount: 20 }),
       expense("usd-earlier", { status: "paid", expenseDate: "2025-10-11", amount: 7, currency: "USD" }),
-    ], resolveDashboardDateRange("1y", asOfDate), asOfDate);
+    ], resolveDashboardDateRange("1y", asOfDate), asOfDate, [], [
+      { expenseId: "eur-later", paymentDate: "2026-10-11", amount: 20 },
+      { expenseId: "usd-earlier", paymentDate: "2025-10-11", amount: 7 },
+    ]);
 
-    expect(result.paidExpenseSeries.map(({ currency }) => currency)).toEqual(["EUR", "USD"]);
-    for (const series of result.paidExpenseSeries) {
+    expect(result.cashflowSeries.map(({ currency }) => currency)).toEqual(["EUR", "USD"]);
+    for (const series of result.cashflowSeries) {
       expect(series.interval).toBe("month");
       expect(series.buckets).toHaveLength(13);
       expect(series.buckets.map(({ date }) => date)).toEqual(
         [...series.buckets.map(({ date }) => date)].sort(),
       );
     }
-    expect(result.paidExpenseSeries[0]?.buckets.at(-1)).toEqual({ date: "2026-10-01", amount: 20 });
-    expect(result.paidExpenseSeries[1]?.buckets[0]).toEqual({ date: "2025-10-01", amount: 7 });
+    expect(result.cashflowSeries[0]?.buckets.at(-1)).toEqual({ date: "2026-10-01", inflows: 0, outflows: 20 });
+    expect(result.cashflowSeries[1]?.buckets[0]).toEqual({ date: "2025-10-01", inflows: 0, outflows: 7 });
+  });
+
+  it("keeps payment history unavailable as a gap instead of inventing zero values", () => {
+    const result = buildDashboardCockpit(
+      [invoice("client")],
+      [expense("expense")],
+      resolveDashboardDateRange("7d", asOfDate),
+      asOfDate,
+      [{ invoiceId: "client", paymentDate: "2026-10-10", amount: 15 }],
+      [{ expenseId: "expense", paymentDate: "2026-10-10", amount: 8 }],
+      { customer: false, expenses: true },
+    );
+
+    expect(result.cashflowSeries[0]?.buckets.find(({ date }) => date === "2026-10-10")).toEqual({
+      date: "2026-10-10",
+      inflows: null,
+      outflows: 8,
+    });
   });
 });

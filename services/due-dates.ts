@@ -137,22 +137,21 @@ export function deduplicateDueDateRecords(
   ];
 }
 
-export function buildDueDateSummary(records: readonly DueDateRecord[]): DueDateSummary {
+export function buildDueDateSummary(records: readonly DueDateRecord[], asOfDate: string): DueDateSummary {
   let receivableCents = 0;
   let payableCents = 0;
   let nonEuroCount = 0;
   let incompleteAmountCount = 0;
   let unclassifiedCount = 0;
 
-  for (const record of records) {
-    if (record.status === "draft" || record.status === "cancelled" || record.status === "paid") continue;
-    const direction = getDirection(record);
+  for (const record of buildDueDateItems([...records], asOfDate)) {
+    const direction = record.direction;
     if (direction === "unclassified") {
       unclassifiedCount += 1;
       continue;
     }
 
-    const remaining = getRemainingAmount(record);
+    const remaining = record.total;
     if (remaining === 0) continue;
     if (remaining === null || !Number.isFinite(remaining) || remaining < 0) {
       incompleteAmountCount += 1;

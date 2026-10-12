@@ -108,7 +108,7 @@ export interface ExpenseRecord {
   recurrenceId?: string | null;
   recurrenceDate?: string | null;
   sourceType?: "expense" | "supplier_invoice";
-  paidAmount?: number;
+  paidAmount?: number | null;
   notes: string | null;
   createdAt: string;
   updatedAt: string;
@@ -388,11 +388,115 @@ export function buildAnnualExpenseSeries(
   }));
 }
 
+function dateOrdinal(value: string): number | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const [year, month, day] = value.split("-").map(Number);
+  const timestamp = Date.UTC(year!, month! - 1, day!);
+  const date = new Date(timestamp);
+  return date.getUTCFullYear() === year
+    && date.getUTCMonth() === month! - 1
+    && date.getUTCDate() === day
+    ? timestamp / 86_400_000
+    : null;
+}
+
+function dateFromOrdinal(ordinal: number): string {
+  return new Date(ordinal * 86_400_000).toISOString().slice(0, 10);
+}
+
+function advanceRecurringDate(
+  date: string,
+  frequency: RecurringExpenseFrequency,
+  anchorDay: number,
+  occurrences = 1,
+): string {
+  if (frequency === "weekly") {
+    return dateFromOrdinal(dateOrdinal(date)! + occurrences * 7);
+  }
+  const monthStep = frequency === "monthly" ? 1 : frequency === "quarterly" ? 3 : 12;
+  const [year, month] = date.split("-").map(Number);
+  const targetMonth = new Date(Date.UTC(year!, month! - 1 + monthStep * occurrences, 1));
+  const lastDay = new Date(Date.UTC(targetMonth.getUTCFullYear(), targetMonth.getUTCMonth() + 1, 0)).getUTCDate();
+  targetMonth.setUTCDate(Math.min(anchorDay, lastDay));
+  return targetMonth.toISOString().slice(0, 10);
+}
+
+export function buildCurrentMonthRecurringExpenseTotals(
+  recurringExpenses: readonly RecurringExpenseRecord[],
+  expenses: readonly ExpenseRecord[],
+  today: string,
+): Map<string, number> {
+  const todayOrdinal = dateOrdinal(today);
+  if (todayOrdinal === null) return new Map();
+
+  const [year, month] = today.split("-").map(Number);
+  const monthStart = `${today.slice(0, 7)}-01`;
+  const monthStartOrdinal = dateOrdinal(monthStart)!;
+  const monthEnd = new Date(Date.UTC(year!, month!, 0)).toISOString().slice(0, 10);
+  const monthEndOrdinal = dateOrdinal(monthEnd)!;
+  const recordedOccurrences = new Set(expenses.flatMap((expense) => (
+    expense.recurrenceId && expense.recurrenceDate
+      ? [`${expense.recurrenceId}:${expense.recurrenceDate}`]
+      : []
+  )));
+  const totalsInCents = new Map<string, number>();
+
+  for (const recurring of recurringExpenses) {
+    if (recurring.status !== "active"
+      || !Number.isFinite(recurring.amount)
+      || recurring.amount <= 0
+      || !/^[A-Z]{3}$/.test(recurring.currency)) continue;
+    const startOrdinal = dateOrdinal(recurring.startDate);
+    const endOrdinal = recurring.endDate ? dateOrdinal(recurring.endDate) : null;
+    let occurrenceDate = recurring.nextDueDate;
+    let occurrenceOrdinal = dateOrdinal(occurrenceDate);
+    if (startOrdinal === null || occurrenceOrdinal === null || occurrenceOrdinal < startOrdinal) continue;
+
+    if (occurrenceOrdinal < monthStartOrdinal) {
+      const [occurrenceYear, occurrenceMonth] = occurrenceDate.split("-").map(Number);
+      const currentMonthIndex = year! * 12 + month! - 1;
+      const occurrenceMonthIndex = occurrenceYear! * 12 + occurrenceMonth! - 1;
+      const step = recurring.frequency === "weekly" ? 0
+        : recurring.frequency === "monthly" ? 1
+          : recurring.frequency === "quarterly" ? 3 : 12;
+      const skipped = recurring.frequency === "weekly"
+        ? Math.ceil((monthStartOrdinal - occurrenceOrdinal) / 7)
+        : Math.max(0, Math.ceil((currentMonthIndex - occurrenceMonthIndex) / step));
+      occurrenceDate = advanceRecurringDate(
+        occurrenceDate,
+        recurring.frequency,
+        Number(recurring.startDate.slice(8, 10)),
+        Math.max(1, skipped),
+      );
+      occurrenceOrdinal = dateOrdinal(occurrenceDate);
+    }
+
+    while (occurrenceOrdinal !== null && occurrenceOrdinal <= monthEndOrdinal) {
+      if (occurrenceOrdinal >= monthStartOrdinal
+        && occurrenceOrdinal >= startOrdinal
+        && (endOrdinal === null || occurrenceOrdinal <= endOrdinal)
+        && !recordedOccurrences.has(`${recurring.id}:${occurrenceDate}`)) {
+        const cents = Math.round((recurring.amount + Number.EPSILON) * 100);
+        totalsInCents.set(recurring.currency, (totalsInCents.get(recurring.currency) ?? 0) + cents);
+      }
+      occurrenceDate = advanceRecurringDate(
+        occurrenceDate,
+        recurring.frequency,
+        Number(recurring.startDate.slice(8, 10)),
+      );
+      occurrenceOrdinal = dateOrdinal(occurrenceDate);
+    }
+  }
+
+  return new Map([...totalsInCents].map(([currency, cents]) => [currency, cents / 100]));
+}
+
 export interface ExpenseFinancialSummary {
   monthSpend: Map<string, number>;
   payable: Map<string, number>;
   paidThisMonth: Map<string, number>;
   overdue: Map<string, number>;
+  incompleteBalanceCount: number;
 }
 
 export function buildExpenseFinancialSummary(
@@ -412,13 +516,18 @@ export function buildExpenseFinancialSummary(
     payable: new Map(),
     paidThisMonth: new Map(),
     overdue: new Map(),
+    incompleteBalanceCount: 0,
   };
   for (const expense of expenses) {
     if (expense.status === "cancelled") continue;
     if (expense.expenseDate.startsWith(month) && expense.expenseDate <= today) {
       add(summary.monthSpend, expense.currency, expense.amount);
     }
-    const paidAmount = expense.paidAmount ?? (expense.status === "paid" ? expense.amount : 0);
+    if (expense.status !== "paid" && expense.paidAmount === null) {
+      summary.incompleteBalanceCount += 1;
+      continue;
+    }
+    const paidAmount = expense.status === "paid" ? expense.amount : expense.paidAmount ?? 0;
     const balance = Math.max(0, Math.round((expense.amount - paidAmount) * 100) / 100);
     const status = getEffectiveExpenseStatus(expense, paidAmount, today);
     if (balance > 0 && status === "overdue") add(summary.overdue, expense.currency, balance);
@@ -433,7 +542,7 @@ export function buildExpenseFinancialSummary(
       add(summary.paidThisMonth, expense.currency, payment.amount);
     }
   }
-  for (const totals of Object.values(summary)) {
+  for (const totals of [summary.monthSpend, summary.payable, summary.paidThisMonth, summary.overdue]) {
     for (const [currency, cents] of totals) totals.set(currency, cents / 100);
   }
   return summary;

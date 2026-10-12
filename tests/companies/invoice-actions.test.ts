@@ -9,7 +9,7 @@ const { getAuthenticatedSupabase, revalidatePath, from } = vi.hoisted(() => ({
 vi.mock("@/lib/supabase/server", () => ({ getAuthenticatedSupabase }));
 vi.mock("next/cache", () => ({ revalidatePath }));
 
-import { deleteInvoice, markInvoiceSettled, recordInvoicePayment, saveInvoice, updateInvoicePaymentStatus } from "@/app/invoices/actions";
+import { deleteInvoice, markInvoiceSettled, recordInvoicePayment, recordSupplierInvoicePayment, saveInvoice, updateInvoicePaymentStatus } from "@/app/invoices/actions";
 
 const companyId = "123e4567-e89b-42d3-a456-426614174000";
 const invoiceId = "123e4567-e89b-42d3-a456-426614174002";
@@ -140,7 +140,7 @@ describe("invoice actions", () => {
     expect(revalidatePath).toHaveBeenCalledWith("/invoices");
   });
 
-  it("rejects a manually selected overdue status before the due date", async () => {
+  it("persists an explicitly selected overdue status even before the due date", async () => {
     const { invoiceQuery } = setup();
 
     const result = await saveInvoice({}, invoiceForm({
@@ -148,8 +148,8 @@ describe("invoice actions", () => {
       status: "overdue",
     }));
 
-    expect(invoiceQuery.insert).not.toHaveBeenCalled();
-    expect(result.error).toContain("après sa date d’échéance");
+    expect(invoiceQuery.insert).toHaveBeenCalledWith(expect.objectContaining({ status: "overdue" }));
+    expect(result.success).toContain("enregistrée");
   });
 
   it("automatically persists overdue for an unpaid invoice past its due date", async () => {
@@ -396,6 +396,78 @@ describe("invoice actions", () => {
     expect(result.success).toContain("enregistrée");
   });
 
+  it("records invoice direction only without changing amounts or currency when invoice_type exists", async () => {
+    const { invoiceQuery } = setup();
+    invoiceQuery.maybeSingle
+      .mockResolvedValueOnce({ data: { customer_id: null, supplier_id: null }, error: null })
+      .mockResolvedValueOnce({ data: { id: invoiceId }, error: null });
+    const formData = invoiceForm({
+      invoiceType: "customer",
+      customerId: "",
+      supplierId: "",
+      subtotal: "999",
+      vatRate: "99",
+      currency: "USD",
+    });
+    formData.set("invoiceId", invoiceId);
+    formData.set("saveMode", "direction_only");
+
+    const result = await saveInvoice({}, formData);
+
+    expect(invoiceQuery.update).toHaveBeenCalledOnce();
+    expect(invoiceQuery.update).toHaveBeenCalledWith({
+      invoice_type: "customer",
+      customer_id: null,
+      supplier_id: null,
+    });
+    expect(result.success).toContain("sans modifier le montant ni la devise");
+    expect(revalidatePath).toHaveBeenCalledWith("/due-dates");
+  });
+
+  it("requires migration 017 to store a direction without a counterparty on schema 016", async () => {
+    const { invoiceQuery } = setup();
+    invoiceQuery.maybeSingle
+      .mockResolvedValueOnce({ data: { customer_id: null, supplier_id: null }, error: null })
+      .mockResolvedValueOnce({
+        data: null,
+        error: { code: "PGRST204", message: "Could not find invoice_type column in schema cache" },
+      });
+    const formData = invoiceForm({ invoiceType: "supplier", customerId: "", supplierId: "" });
+    formData.set("invoiceId", invoiceId);
+    formData.set("saveMode", "direction_only");
+
+    const result = await saveInvoice({}, formData);
+
+    expect(invoiceQuery.update).toHaveBeenCalledOnce();
+    expect(result.error).toContain("migration 017");
+    expect(revalidatePath).not.toHaveBeenCalled();
+  });
+
+  it("uses a verified supplier relation on schema 016 without writing monetary fields", async () => {
+    const supplierId = "123e4567-e89b-42d3-a456-426614174005";
+    const { contactQuery, invoiceQuery } = setup({
+      contactResult: { data: { id: supplierId, name: "Fournisseur Exemple" }, error: null },
+    });
+    invoiceQuery.maybeSingle
+      .mockResolvedValueOnce({ data: { customer_id: null, supplier_id: null }, error: null })
+      .mockResolvedValueOnce({
+        data: null,
+        error: { code: "42703", message: "column invoice_type does not exist" },
+      })
+      .mockResolvedValueOnce({ data: { id: invoiceId }, error: null });
+    const formData = invoiceForm({ invoiceType: "supplier", customerId: "", supplierId });
+    formData.set("invoiceId", invoiceId);
+    formData.set("saveMode", "direction_only");
+
+    const result = await saveInvoice({}, formData);
+
+    expect(contactQuery.select).toHaveBeenCalledWith("id, name");
+    expect(invoiceQuery.update).toHaveBeenNthCalledWith(2, { customer_id: null, supplier_id: supplierId });
+    expect(invoiceQuery.update.mock.calls[1]?.[0]).not.toHaveProperty("total_ttc");
+    expect(invoiceQuery.update.mock.calls[1]?.[0]).not.toHaveProperty("currency");
+    expect(result.success).toContain("confirmé par le tiers associé");
+  });
+
   it("records a customer payment only after checking membership and delegates balance validation to the RPC", async () => {
     const { membershipQuery, rpc } = setup();
 
@@ -422,6 +494,61 @@ describe("invoice actions", () => {
     rpc.mockResolvedValueOnce({ error: { code: "22003" } });
     const overpayment = await recordInvoicePayment(companyId, invoiceId, "2026-10-03", "150", "", "");
     expect(overpayment.error).toContain("dépasse le solde restant");
+  });
+
+  it("records a supplier invoice payment with its actual date through the ledger RPC", async () => {
+    const { rpc } = setup();
+
+    const requestId = "123e4567-e89b-42d3-a456-426614174003";
+    const result = await recordSupplierInvoicePayment(companyId, invoiceId, "2026-10-08", "42,50", requestId);
+
+    expect(rpc).toHaveBeenCalledWith("record_supplier_invoice_payment_idempotent", {
+      target_invoice_id: invoiceId,
+      target_payment_date: "2026-10-08",
+      target_amount: 42.5,
+      target_request_id: requestId,
+    });
+    expect(result.success).toContain("paiement fournisseur daté");
+    expect(revalidatePath).toHaveBeenCalledWith("/expenses");
+    expect(revalidatePath).toHaveBeenCalledWith("/invoices");
+    expect(revalidatePath).toHaveBeenCalledWith("/dashboard");
+  });
+
+  it("surfaces supplier payment persistence failures without claiming success", async () => {
+    const { rpc } = setup();
+    rpc.mockResolvedValueOnce({ error: { code: "42501" } });
+
+    const result = await recordSupplierInvoicePayment(
+      companyId,
+      invoiceId,
+      "2026-10-08",
+      "42.50",
+      "123e4567-e89b-42d3-a456-426614174003",
+    );
+
+    expect(result.error).toContain("droits nécessaires");
+    expect(result.success).toBeUndefined();
+    expect(revalidatePath).not.toHaveBeenCalled();
+  });
+
+  it("requires a stable valid idempotency key and explains that the database migrations must be applied remotely", async () => {
+    const { rpc } = setup();
+    const invalid = await recordSupplierInvoicePayment(companyId, invoiceId, "2026-10-08", "42.50", "not-a-uuid");
+    expect(invalid.error).toContain("date de paiement");
+    expect(rpc).not.toHaveBeenCalled();
+
+    rpc.mockResolvedValueOnce({ error: { code: "PGRST202" } });
+    const missingRpc = await recordSupplierInvoicePayment(
+      companyId,
+      invoiceId,
+      "2026-10-08",
+      "42.50",
+      "123e4567-e89b-42d3-a456-426614174003",
+    );
+    expect(missingRpc.error).toContain("application manuelle des migrations 018");
+    expect(missingRpc.error).toContain("sur Supabase");
+    expect(missingRpc.success).toBeUndefined();
+    expect(revalidatePath).not.toHaveBeenCalled();
   });
 
   it("does not call the payment RPC when the user lacks company membership", async () => {
@@ -470,51 +597,34 @@ describe("invoice actions", () => {
     expect(result.success).toContain("supprimée");
   });
 
-  it("settles a company invoice only after membership and restricts the eligible statuses", async () => {
+  it("does not mark a company invoice paid without a dated payment", async () => {
     const { membershipQuery, invoiceQuery } = setup();
-    invoiceQuery.maybeSingle.mockResolvedValue({
-      data: { status: "pending", due_date: "2026-10-30" },
-      error: null,
-    });
 
     const result = await markInvoiceSettled(companyId, invoiceId);
 
-    expect(membershipQuery.maybeSingle).toHaveBeenCalled();
-    expect(invoiceQuery.update).toHaveBeenCalledWith({ status: "paid" });
-    expect(invoiceQuery.eq).toHaveBeenCalledWith("id", invoiceId);
-    expect(invoiceQuery.eq).toHaveBeenCalledWith("status", "pending");
-    expect(invoiceQuery.eq).toHaveBeenCalledWith("company_id", companyId);
-    expect(invoiceQuery.is).toHaveBeenCalledWith("user_id", null);
-    expect(result.success).toContain("mis à jour");
-    expect(revalidatePath).toHaveBeenCalledWith("/due-dates");
-  });
-
-  it("settles a personal invoice only for the authenticated owner", async () => {
-    const { membershipQuery, invoiceQuery } = setup();
-    invoiceQuery.maybeSingle.mockResolvedValue({
-      data: { status: "overdue", due_date: "2026-10-01" },
-      error: null,
-    });
-
-    await markInvoiceSettled(null, invoiceId);
-
+    expect(result.error).toContain("paiement daté");
     expect(membershipQuery.maybeSingle).not.toHaveBeenCalled();
-    expect(invoiceQuery.eq).toHaveBeenCalledWith("user_id", "123e4567-e89b-42d3-a456-426614174001");
-    expect(invoiceQuery.is).toHaveBeenCalledWith("company_id", null);
+    expect(invoiceQuery.update).not.toHaveBeenCalled();
   });
 
-  it("marks an overdue invoice as paid so it is no longer overdue", async () => {
+  it("does not mark a personal invoice paid without a dated payment", async () => {
+    const { membershipQuery, invoiceQuery } = setup();
+
+    const result = await markInvoiceSettled(null, invoiceId);
+
+    expect(result.error).toContain("paiement daté");
+    expect(membershipQuery.maybeSingle).not.toHaveBeenCalled();
+    expect(invoiceQuery.update).not.toHaveBeenCalled();
+  });
+
+  it("requires a dated payment instead of allowing a status-only paid update", async () => {
     const { invoiceQuery } = setup();
-    invoiceQuery.maybeSingle.mockResolvedValue({
-      data: { status: "overdue", due_date: "2026-10-01" },
-      error: null,
-    });
 
-    const result = await markInvoiceSettled(companyId, invoiceId);
+    const result = await updateInvoicePaymentStatus(companyId, invoiceId, "paid");
 
-    expect(invoiceQuery.update).toHaveBeenCalledWith({ status: "paid" });
-    expect(invoiceQuery.eq).toHaveBeenCalledWith("status", "overdue");
-    expect(result.success).toContain("mis à jour");
+    expect(result.error).toContain("paiement daté");
+    expect(invoiceQuery.update).not.toHaveBeenCalled();
+    expect(revalidatePath).not.toHaveBeenCalled();
   });
 
   it("persists a manual overdue choice even when its due date is in the future", async () => {

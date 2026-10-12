@@ -135,8 +135,7 @@ export default async function ExpensesPage() {
       : { data: [], error: null }) as typeof companyInvoices;
     invoiceTypeAvailable = false;
   }
-  const requiredError = personalExpenses.error ?? companyExpenses.error
-    ?? personalRecurring.error ?? companyRecurring.error;
+  const requiredError = personalExpenses.error ?? companyExpenses.error;
   if (requiredError) {
     console.error("Expense workspace query failed", { code: requiredError.code });
     return renderError(["42P01", "42703", "PGRST202", "PGRST204", "PGRST205"].includes(requiredError.code ?? "")
@@ -156,16 +155,21 @@ export default async function ExpensesPage() {
     ...(personalInvoices.data ?? []),
     ...(companyInvoices.data ?? []),
   ]);
+  const recurringQueryError = personalRecurring.error ?? companyRecurring.error;
   const parsedRecurring = z.array(recurringExpenseRowSchema).safeParse([
-    ...(personalRecurring.data ?? []),
-    ...(companyRecurring.data ?? []),
+    ...(personalRecurring.error ? [] : personalRecurring.data ?? []),
+    ...(companyRecurring.error ? [] : companyRecurring.data ?? []),
   ]);
-  if (!parsedExpenses.success || !parsedSuppliers.success || !parsedInvoices.success || !parsedRecurring.success) {
+  if (!parsedExpenses.success || !parsedSuppliers.success || !parsedInvoices.success) {
     console.error("Expense workspace query returned unexpected data");
     return renderError("Les données reçues pour les dépenses ne sont pas au format attendu.", companies.data);
   }
 
   const warningMessages: string[] = [];
+  if (recurringQueryError || !parsedRecurring.success) {
+    console.error("Recurring expense query unavailable", { code: recurringQueryError?.code ?? "INVALID_RESULT" });
+    warningMessages.push("Les dépenses restent visibles, mais les abonnements récurrents ne sont pas tous disponibles. Vérifiez la migration 016.");
+  }
   const linkedDocumentIds = [...new Set(parsedInvoices.data.flatMap(({ document_id }) => document_id ? [document_id] : []))];
   const supplierInvoiceDocumentIds = new Set<string>();
   const invoiceDocumentsById = new Map<string, z.infer<typeof invoiceSourceDocumentSchema>[number]>();
@@ -221,9 +225,6 @@ export default async function ExpensesPage() {
     warningMessages.push("Certains justificatifs ne peuvent pas être affichés.");
     console.error("Expense document query failed", { code: expenseDocuments.error?.code ?? invoiceDocuments.error?.code });
   }
-  const documentWarning = warningMessages.length
-    ? `Les dépenses restent disponibles. ${warningMessages.join(" ")}`
-    : null;
   const documents = parsedDocuments.success ? parsedDocuments.data : [];
   const suppliers = parsedSuppliers.data;
   const documentOptions = documents.map(({ id, user_id, company_id, file_name }) => ({
@@ -307,16 +308,20 @@ export default async function ExpensesPage() {
       .in("expense_id", expenseIds)
       .order("payment_date", { ascending: false })
     : { data: [], error: null };
+  let paymentHistoryAvailable = !paymentResult.error;
   if (paymentResult.error) {
     console.error("Expense payment query failed", { code: paymentResult.error.code });
-    return renderError("Impossible de charger l’historique des paiements. Vérifiez la migration 015.", companies.data);
+    warningMessages.push(["42P01", "42703", "PGRST202", "PGRST204", "PGRST205"].includes(paymentResult.error.code ?? "")
+      ? "L’historique des paiements de dépenses nécessite la migration 016 ; les lignes restent visibles, mais leurs soldes sont à vérifier."
+      : "L’historique des paiements de dépenses est inaccessible ; les lignes restent visibles, mais leurs soldes sont à vérifier.");
   }
-  const paymentsParsed = z.array(expensePaymentRowSchema).safeParse(paymentResult.data ?? []);
+  const paymentsParsed = z.array(expensePaymentRowSchema).safeParse(paymentResult.error ? [] : paymentResult.data ?? []);
   if (!paymentsParsed.success) {
     console.error("Expense payment query returned unexpected data");
-    return renderError("L’historique des paiements reçus n’est pas au format attendu.", companies.data);
+    paymentHistoryAvailable = false;
+    warningMessages.push("L’historique des paiements reçus n’est pas au format attendu ; les soldes concernés sont à vérifier.");
   }
-  const payments: ExpensePaymentRecord[] = paymentsParsed.data.map((payment) => ({
+  const payments: ExpensePaymentRecord[] = (paymentsParsed.success ? paymentsParsed.data : []).map((payment) => ({
     id: payment.id,
     expenseId: payment.expense_id,
     paymentDate: payment.payment_date,
@@ -330,10 +335,17 @@ export default async function ExpensesPage() {
   for (const expense of expenses) {
     if (expense.sourceType === "supplier_invoice") continue;
     if (expense.status === "cancelled") continue;
-    expense.paidAmount = Math.round((paymentsByExpense.get(expense.id) ?? (expense.status === "paid" ? expense.amount : 0)) * 100) / 100;
-    if (expense.status === "paid" || expense.paidAmount >= expense.amount) expense.status = "paid";
+    expense.paidAmount = expense.status === "paid" ? expense.amount
+      : paymentHistoryAvailable
+        ? Math.round((paymentsByExpense.get(expense.id) ?? 0) * 100) / 100
+        : null;
+    if (expense.status === "paid" || (expense.paidAmount !== null && expense.paidAmount >= expense.amount)) expense.status = "paid";
     else if (expense.dueDate && expense.dueDate < today) expense.status = "overdue";
   }
+
+  const documentWarning = warningMessages.length
+    ? `Les dépenses restent disponibles. ${warningMessages.join(" ")}`
+    : null;
 
   return (
     <AppShell pageTitle="expenses">
@@ -343,7 +355,9 @@ export default async function ExpensesPage() {
         documents={documentOptions}
         expenses={expenses}
         payments={payments}
-        recurringExpenses={parsedRecurring.data.map((row) => mapRecurringExpense(row, suppliers, documents))}
+        recurringExpenses={parsedRecurring.success
+          ? parsedRecurring.data.map((row) => mapRecurringExpense(row, suppliers, documents))
+          : []}
         loadError={null}
         supplierWarning={documentWarning}
         today={today}

@@ -15,10 +15,13 @@ import {
   WalletCards,
 } from "lucide-react";
 import { Badge } from "@/database/components/ui/badge";
+import { DashboardCashflowChart } from "@/database/components/dashboard/dashboard-cashflow-chart";
 import {
   buildDashboardCockpit,
   resolveDashboardDateRange,
-  type DashboardChartInterval,
+  type DashboardExpensePayment,
+  type DashboardInvoicePayment,
+  type DashboardPaymentHistoryAvailability,
   type DashboardPeriod,
 } from "@/services/dashboard";
 import { getInvoiceDirection, getInvoiceDisplayStatus, getInvoiceRemainingAmount } from "@/services/invoice-validation";
@@ -28,6 +31,9 @@ import type { InvoiceCompany, InvoiceRecord } from "@/types/invoice";
 interface DashboardClientProps {
   invoices: InvoiceRecord[];
   expenses?: ExpenseRecord[];
+  customerPayments?: DashboardInvoicePayment[];
+  expensePayments?: DashboardExpensePayment[];
+  paymentHistoryAvailability?: DashboardPaymentHistoryAvailability;
   companies?: Pick<InvoiceCompany, "id" | "name" | "currency">[];
   counterpartyNames?: Record<string, string>;
   partyLinksAvailable?: boolean;
@@ -39,11 +45,21 @@ interface DashboardClientProps {
 
 const periods: Array<{ key: Exclude<DashboardPeriod, "custom">; label: string }> = [
   { key: "7d", label: "7 jours" },
-  { key: "1m", label: "1 mois" },
+  { key: "1m", label: "30 jours" },
   { key: "3m", label: "3 mois" },
   { key: "6m", label: "6 mois" },
   { key: "1y", label: "1 an" },
 ];
+
+const unavailablePaymentHistory: DashboardPaymentHistoryAvailability = { customer: false, expenses: false };
+type CashflowSeriesKey = "inflows" | "outflows";
+
+function toggleHiddenSeries(current: Set<CashflowSeriesKey>, key: CashflowSeriesKey) {
+  const next = new Set(current);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  return next;
+}
 
 function currencyFormat(value: number, currency: string) {
   try {
@@ -51,23 +67,6 @@ function currencyFormat(value: number, currency: string) {
   } catch {
     return `${value.toLocaleString("fr-FR", { maximumFractionDigits: 2 })} ${currency}`;
   }
-}
-
-function chartAxisFormat(value: number, currency: string) {
-  return new Intl.NumberFormat("fr-FR", {
-    style: "currency",
-    currency,
-    notation: "compact",
-    maximumFractionDigits: 1,
-  }).format(value);
-}
-
-function chartDateFormat(value: string, interval: DashboardChartInterval) {
-  const [year, month, day] = value.split("-").map(Number);
-  const date = new Date(Date.UTC(year!, month! - 1, day!));
-  return new Intl.DateTimeFormat("fr-FR", interval === "month"
-    ? { month: "short", year: "2-digit", timeZone: "UTC" }
-    : { day: "2-digit", month: "2-digit", timeZone: "UTC" }).format(date);
 }
 
 function formatTotals(totals: Array<{ currency: string; amount: number }>) {
@@ -103,8 +102,9 @@ function dateHeading(value: string) {
   }).format(date);
 }
 
-function dueDescription(dueDate: string | null, asOfDate: string) {
+function dueDescription(dueDate: string | null, asOfDate: string, manuallyOverdue = false) {
   if (!dueDate) return "Échéance absente";
+  if (manuallyOverdue && dueDate >= asOfDate) return "Statut En retard choisi manuellement";
   const difference = Math.round(
     (Date.parse(`${dueDate}T00:00:00Z`) - Date.parse(`${asOfDate}T00:00:00Z`)) / 86_400_000,
   );
@@ -183,6 +183,9 @@ function Metric({
 export function DashboardClient({
   invoices,
   expenses = [],
+  customerPayments = [],
+  expensePayments = [],
+  paymentHistoryAvailability = unavailablePaymentHistory,
   companies = [],
   counterpartyNames = {},
   partyLinksAvailable = true,
@@ -197,6 +200,7 @@ export function DashboardClient({
   const [period, setPeriod] = useState<DashboardPeriod>("1m");
   const [customStart, setCustomStart] = useState("");
   const [customEnd, setCustomEnd] = useState(asOfDate);
+  const [hiddenCashflowSeries, setHiddenCashflowSeries] = useState<Set<"inflows" | "outflows">>(() => new Set());
   const visibleInvoices = useMemo(
     () => invoices.filter((invoice) => ownerFilter === "all"
       || (ownerFilter === "personal" ? invoice.companyId === null : invoice.companyId === ownerFilter)),
@@ -212,8 +216,16 @@ export function DashboardClient({
     [asOfDate, customEnd, customStart, period],
   );
   const cockpit = useMemo(
-    () => buildDashboardCockpit(visibleInvoices, visibleExpenses, range, asOfDate),
-    [asOfDate, range, visibleExpenses, visibleInvoices],
+    () => buildDashboardCockpit(
+      visibleInvoices,
+      visibleExpenses,
+      range,
+      asOfDate,
+      customerPayments,
+      expensePayments,
+      paymentHistoryAvailability,
+    ),
+    [asOfDate, customerPayments, expensePayments, paymentHistoryAvailability, range, visibleExpenses, visibleInvoices],
   );
   const overdueAmount = useMemo(() => invoiceTotals(cockpit.overdueCustomerInvoices), [cockpit.overdueCustomerInvoices]);
   const allOverdueAmount = useMemo(() => invoiceTotals(cockpit.overdueInvoices), [cockpit.overdueInvoices]);
@@ -263,7 +275,7 @@ export function DashboardClient({
         <Metric icon={WalletCards} label="Dépenses enregistrées" value={expensesLoadError || !range.valid ? "—" : formatTotals(cockpit.expenseTotals)} hint={`Dépenses non annulées · ${selectedPeriodLabel} (pas un relevé bancaire)`} href="/expenses" tone="orange" />
       </section>
       <p className="dashboard-note dashboard-data-limit">
-        Les règlements partiels ne sont pas enregistrés sur les factures : les soldes reprennent le total des factures actives et excluent celles marquées payées ou annulées.
+        Les montants « à encaisser » et « à payer » sont des montants restants d’après les statuts et paiements enregistrés, pas des soldes bancaires.
       </p>
 
       <section className="surface-panel dashboard-section-panel dashboard-period-panel" aria-labelledby="dashboard-period-heading">
@@ -285,22 +297,50 @@ export function DashboardClient({
         ) : null}
         {!range.valid ? <p className="dashboard-empty-message" role="alert">Sélectionnez une période de dates valide.</p> : null}
         {expensesLoadError ? <p className="dashboard-empty-message" role="alert">{expensesLoadError}</p> : null}
-        {!expensesLoadError && range.valid && cockpit.paidExpenseSeries.length ? (
+        <div className="dashboard-chart-legend" aria-label="Séries financières">
+          <button
+            type="button"
+            className={`dashboard-chart-legend-item ${hiddenCashflowSeries.has("inflows") ? "is-hidden" : ""}`}
+            aria-pressed={!hiddenCashflowSeries.has("inflows")}
+            disabled={!paymentHistoryAvailability.customer}
+            onClick={() => setHiddenCashflowSeries((current) => toggleHiddenSeries(current, "inflows"))}
+          >
+            <span className="dashboard-chart-legend-mark inflows" />
+            <span>Entrées clients</span>
+          </button>
+          <button
+            type="button"
+            className={`dashboard-chart-legend-item ${hiddenCashflowSeries.has("outflows") ? "is-hidden" : ""}`}
+            aria-pressed={!hiddenCashflowSeries.has("outflows")}
+            disabled={!paymentHistoryAvailability.expenses}
+            onClick={() => setHiddenCashflowSeries((current) => toggleHiddenSeries(current, "outflows"))}
+          >
+            <span className="dashboard-chart-legend-mark outflows" />
+            <span>Dépenses payées</span>
+          </button>
+        </div>
+        {range.valid && cockpit.cashflowSeries.length ? (
           <div className="dashboard-chart-wrap">
-            {cockpit.paidExpenseSeries.map(({ currency, interval, buckets }) => (
-              <div className="dashboard-chart-series" key={currency}>
-                <h3>{currency}</h3>
-                <ExpenseChart buckets={buckets} currency={currency} interval={interval} />
+            {cockpit.cashflowSeries.map((series) => (
+              <div className="dashboard-chart-series" key={series.currency}>
+                <h3>{series.currency}</h3>
+                <DashboardCashflowChart
+                  series={series}
+                  hiddenSeries={hiddenCashflowSeries}
+                />
               </div>
             ))}
-            <p className="dashboard-chart-legend"><span />Dépenses enregistrées comme payées, regroupées par date de dépense et devise.</p>
           </div>
         ) : null}
-        {!expensesLoadError && range.valid && cockpit.paidExpenseSeries.length === 0 ? (
-          <p className="dashboard-empty-message">Aucune dépense marquée comme payée sur cette période pour afficher une série de mouvements.</p>
+        {range.valid && cockpit.cashflowSeries.length === 0 ? (
+          <p className="dashboard-empty-message">
+            {paymentHistoryAvailability.customer || paymentHistoryAvailability.expenses
+              ? "Aucun paiement client ni paiement de dépense enregistré sur cette période."
+              : "Les journaux de paiements datés ne sont pas disponibles dans le schéma chargé."}
+          </p>
         ) : null}
         <p className="dashboard-note">
-          Aucun journal de règlements clients/fournisseurs ni solde initial bancaire n’est disponible. Les encaissements et le solde bancaire ne sont donc pas tracés. Les factures fournisseurs ne sont pas additionnées aux dépenses pour éviter un double comptage.
+          Les courbes montrent uniquement les paiements datés enregistrés (pas les factures simplement marquées payées). Les paiements fournisseurs liés apparaissent une seule fois. Le solde bancaire reste indisponible : aucune connexion bancaire ni solde initial vérifié n’est enregistré.
         </p>
       </section>
 
@@ -394,60 +434,12 @@ function InvoiceDueLink({
       <span className="dashboard-upcoming-copy">
         <strong>{counterpartyLabel(invoice, names)}</strong>
         <small>{invoice.invoiceNumber || "Facture sans numéro"} · {direction}</small>
-        <small>{dueDescription(invoice.dueDate, asOfDate)}</small>
+        <small>{dueDescription(invoice.dueDate, asOfDate, invoice.status === "overdue")}</small>
       </span>
       <span className="dashboard-upcoming-value">
         <strong>{invoice.total === null || !invoice.currency ? "Montant à vérifier" : currencyFormat(invoice.total, invoice.currency)}</strong>
                     <Badge tone={statusTone(invoice)}>{statusLabel(invoice)}</Badge>
       </span>
     </Link>
-  );
-}
-
-function ExpenseChart({
-  buckets,
-  currency,
-  interval,
-}: {
-  buckets: Array<{ date: string; amount: number }>;
-  currency: string;
-  interval: DashboardChartInterval;
-}) {
-  const width = 720;
-  const height = 220;
-  const padding = { top: 16, right: 16, bottom: 40, left: 48 };
-  const chartWidth = width - padding.left - padding.right;
-  const chartHeight = height - padding.top - padding.bottom;
-  const maxAmount = Math.max(...buckets.map(({ amount }) => amount), 0);
-  const safeMax = maxAmount || 1;
-  const slotWidth = chartWidth / buckets.length;
-  const barWidth = Math.min(32, slotWidth * 0.62);
-
-  return (
-    <div className="dashboard-chart-scroll">
-      <svg className="dashboard-expense-chart" width={width} height={height} viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Dépenses enregistrées comme payées par date">
-        {[0, 0.5, 1].map((fraction) => {
-          const y = padding.top + chartHeight * fraction;
-          return <g key={fraction}><line x1={padding.left} x2={width - padding.right} y1={y} y2={y} className="dashboard-chart-gridline" /><text x={padding.left - 7} y={y + 4} textAnchor="end" className="dashboard-chart-axis">{chartAxisFormat(maxAmount * (1 - fraction), currency)}</text></g>;
-        })}
-        {buckets.map(({ date, amount }, index) => {
-          const barHeight = chartHeight * amount / safeMax;
-          const x = padding.left + slotWidth * index + (slotWidth - barWidth) / 2;
-          const y = padding.top + chartHeight - barHeight;
-          return (
-            <g key={date}>
-              {amount > 0 ? (
-                <rect x={x} y={y} width={barWidth} height={Math.max(barHeight, 1)} rx="4" className="dashboard-chart-bar">
-                  <title>{`${dateFormat(date)} · ${currencyFormat(amount, currency)}`}</title>
-                </rect>
-              ) : null}
-              {(buckets.length < 9 || index % Math.ceil(buckets.length / 8) === 0 || index === buckets.length - 1) ? (
-                <text x={padding.left + slotWidth * index + slotWidth / 2} y={height - 13} textAnchor="middle" className="dashboard-chart-axis">{chartDateFormat(date, interval)}</text>
-              ) : null}
-            </g>
-          );
-        })}
-      </svg>
-    </div>
   );
 }

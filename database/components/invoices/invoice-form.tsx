@@ -5,6 +5,7 @@ import { useActionState, useEffect, useState } from "react";
 import { createContact } from "@/app/contacts/actions";
 import { saveInvoice, type InvoiceActionState } from "@/app/invoices/actions";
 import { calculateInvoiceAmounts, formatInvoiceAmount } from "@/services/manual-invoice";
+import { getInvoiceDirection } from "@/services/invoice-validation";
 import type { ContactKind, ContactRecord, InvoiceCompany, InvoicePaymentStatus, InvoiceRecord, InvoiceStatus } from "@/types/invoice";
 
 const blankState: InvoiceActionState = {};
@@ -21,7 +22,7 @@ function today() {
 }
 
 function editableStatus(status: InvoiceStatus | undefined): InvoicePaymentStatus {
-  return status === "paid" ? "paid" : "pending";
+  return status === "paid" || status === "overdue" ? status : "pending";
 }
 
 export function InvoiceForm({
@@ -50,6 +51,7 @@ export function InvoiceForm({
   const [state, formAction, pending] = useActionState(saveInvoice, blankState);
   const [companyId, setCompanyId] = useState(invoice?.companyId ?? initialCompanyId);
   const [contactChoices, setContactChoices] = useState(contacts);
+  const [dueDate, setDueDate] = useState(invoice?.dueDate ?? (sourceDocument ? "" : today()));
   const [partyKind, setPartyKind] = useState<"none" | ContactKind>(() => (
     invoice?.invoiceType === "customer" ? "customers" : invoice?.invoiceType === "supplier" ? "suppliers"
       : invoice?.customerId ? "customers" : invoice?.supplierId ? "suppliers"
@@ -248,12 +250,13 @@ export function InvoiceForm({
         </label>
         <label className="invoice-field">
           <span>Date d’échéance</span>
-          <input name="dueDate" type="date" defaultValue={invoice?.dueDate ?? (sourceDocument ? "" : today())} required />
+          <input name="dueDate" type="date" value={dueDate} onChange={(event) => setDueDate(event.target.value)} required />
         </label>
         <label className="invoice-field">
           <span>Statut</span>
           <select name="status" value={status} onChange={(event) => setStatus(event.target.value as typeof status)} required>
               <option value="pending">{partyKind === "customers" ? "Impayée" : "À payer"}</option>
+              <option value="overdue">En retard</option>
               {partyKind !== "customers" || invoice?.status === "paid" ? <option value="paid">Payée</option> : null}
           </select>
         </label>
@@ -266,6 +269,11 @@ export function InvoiceForm({
         <button className="primary-button" type="submit" disabled={pending || !calculated}>
           {pending ? "Enregistrement…" : "Enregistrer la facture"}
         </button>
+        {invoice && getInvoiceDirection(invoice) === null ? (
+              <button className="text-button" type="submit" name="saveMode" value="direction_only" formNoValidate disabled={pending || partyKind === "none"}>
+            Enregistrer uniquement le sens
+          </button>
+        ) : null}
         <button className="text-button" type="button" onClick={onCancel} disabled={pending}>Annuler</button>
       </div>
     </form>

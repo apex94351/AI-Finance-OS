@@ -47,6 +47,7 @@ export const config = {
     "/invoices/:path*",
     "/finance/:path*",
     "/expenses/:path*",
+    "/treasury/:path*",
     "/revenue/:path*",
     "/due-dates/:path*",
     "/documents/:path*",

@@ -4,16 +4,18 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { InvoiceCompany, InvoiceRecord } from "@/types/invoice";
 
-const { refresh, deleteInvoice, updateInvoicePaymentStatus } = vi.hoisted(() => ({
+const { refresh, deleteInvoice, updateInvoicePaymentStatus, recordSupplierInvoicePayment } = vi.hoisted(() => ({
   refresh: vi.fn(),
   deleteInvoice: vi.fn(),
   updateInvoicePaymentStatus: vi.fn(),
+  recordSupplierInvoicePayment: vi.fn(),
 }));
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh }) }));
 vi.mock("@/app/invoices/actions", () => ({
   deleteInvoice,
   updateInvoicePaymentStatus,
+  recordSupplierInvoicePayment,
   saveInvoice: vi.fn(),
 }));
 
@@ -142,6 +144,43 @@ describe("invoice manager", () => {
     expect(screen.getByText(/Aucune donnée de démonstration n’est utilisée ici/)).toBeTruthy();
   });
 
+  it("distinguishes an unconfirmed direction from an invalid amount or currency", () => {
+    const unclassifiedInvoice: InvoiceRecord = {
+      ...invoices[0]!,
+      invoiceType: null,
+      customerId: null,
+      supplierId: null,
+      sourceDocumentCategory: null,
+      total: 120,
+      currency: "EUR",
+    };
+    render(<InvoiceManager companies={companies} invoices={[unclassifiedInvoice]} loadError={null} />);
+
+    const warning = screen.getByRole("status");
+    expect(warning.textContent).toContain("1 facture a un sens financier non confirmé");
+    expect(warning.textContent).toContain("montant et une devise exploitables");
+    expect(warning.textContent).not.toContain("Montant ou devise à vérifier");
+    expect(warning.textContent).toContain("nécessite la migration 017");
+  });
+
+  it("offers a direction-only save when editing an unclassified invoice", () => {
+    const unclassifiedInvoice: InvoiceRecord = {
+      ...invoices[0]!,
+      invoiceType: null,
+      customerId: null,
+      supplierId: null,
+      sourceDocumentCategory: null,
+    };
+    const { container } = render(<InvoiceManager companies={companies} invoices={[unclassifiedInvoice]} loadError={null} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Modifier" }));
+    fireEvent.change(screen.getByRole("combobox", { name: "Sens de la facture" }), { target: { value: "suppliers" } });
+
+    expect(screen.getByRole("button", { name: "Enregistrer uniquement le sens" })).toBeTruthy();
+    expect((container.querySelector('input[name="invoiceType"]') as HTMLInputElement).value).toBe("supplier");
+    expect((screen.getByRole("spinbutton", { name: "Montant HT (EUR)" }) as HTMLInputElement).value).toBe("100.00");
+  });
+
   it("shows client, supplier, and late invoice links that feed the existing URL filters", () => {
     const supplierInvoice: InvoiceRecord = {
       ...invoices[0]!,
@@ -211,8 +250,9 @@ describe("invoice manager", () => {
     expect(invoiceNumber.hasAttribute("required")).toBe(true);
     expect(within(status).queryByRole("option", { name: "Brouillon" })).toBeNull();
     expect(within(status).getByRole("option", { name: "Impayée" })).toBeTruthy();
+    expect(within(status).getByRole("option", { name: "En retard" })).toBeTruthy();
     expect(within(status).queryByRole("option", { name: "Payée" })).toBeNull();
-    expect(within(status).queryByRole("option", { name: "En retard" })).toBeNull();
+    expect(within(status).getByRole("option", { name: "En retard" })).toBeTruthy();
   });
 
   it("filters on every character without case sensitivity, normalizes spaces, and restores on clear", () => {
@@ -260,14 +300,25 @@ describe("invoice manager", () => {
   });
 
   it("keeps supplier status changes on the existing payment-status action", async () => {
-    updateInvoicePaymentStatus.mockResolvedValue({ success: "Le statut de la facture a été mis à jour." });
-    const supplierInvoice = { ...invoices[0]!, invoiceType: "supplier" as const, supplierId: "supplier-1", customerId: null };
+    const supplierInvoice = { ...invoices[0]!, invoiceType: "supplier" as const, supplierId: "supplier-1", customerId: null, paidAmount: 0 };
     render(<InvoiceManager companies={companies} invoices={[supplierInvoice]} loadError={null} />);
     fireEvent.click(screen.getByRole("button", { name: "Statut À payer pour FAC-100" }));
     fireEvent.click(screen.getByRole("button", { name: "Payée" }));
 
-    expect(updateInvoicePaymentStatus).toHaveBeenCalledWith(companies[0]!.id, supplierInvoice.id, "paid");
-    expect(await screen.findByRole("status")).toBeTruthy();
+    expect(updateInvoicePaymentStatus).not.toHaveBeenCalled();
+    expect(screen.getByRole("heading", { name: "Payer · FAC-100" })).toBeTruthy();
+    expect(screen.getByLabelText("Date réelle du paiement")).toBeTruthy();
+  });
+
+  it("offers the manual overdue status in the invoice status menu", async () => {
+    updateInvoicePaymentStatus.mockResolvedValue({ success: "Statut mis à jour." });
+    const pastDueInvoice = { ...invoices[0]!, dueDate: "2020-10-10", status: "pending" as const };
+    render(<InvoiceManager companies={companies} invoices={[pastDueInvoice]} loadError={null} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Statut En retard pour FAC-100" }));
+    fireEvent.click(await screen.findByRole("button", { name: "En retard" }));
+
+    expect(updateInvoicePaymentStatus).toHaveBeenCalledWith(companies[0]!.id, pastDueInvoice.id, "overdue");
   });
 
   it("offers payment recording for customer invoices instead of manually forcing paid status", () => {
@@ -288,7 +339,7 @@ describe("invoice manager", () => {
       }
       return { x: 0, y: 0, top: 0, right: 0, bottom: 0, left: 0, width: 0, height: 0, toJSON: () => ({}) };
     });
-    const supplierInvoice = { ...invoices[0]!, invoiceType: "supplier" as const, supplierId: "supplier-1", customerId: null };
+    const supplierInvoice = { ...invoices[0]!, invoiceType: "supplier" as const, supplierId: "supplier-1", customerId: null, paidAmount: 0 };
     render(<InvoiceManager companies={companies} invoices={[supplierInvoice]} loadError={null} />);
     fireEvent.click(screen.getByRole("button", { name: "Statut À payer pour FAC-100" }));
 
@@ -301,15 +352,15 @@ describe("invoice manager", () => {
     expect(within(menuContainer as HTMLElement).getByRole("button", { name: "Payée" })).toBeTruthy();
   });
 
-  it("shows a clear error instead of success when the status update fails", async () => {
-    updateInvoicePaymentStatus.mockResolvedValue({ error: "La mise à jour du statut a échoué." });
-    const supplierInvoice = { ...invoices[0]!, invoiceType: "supplier" as const, supplierId: "supplier-1", customerId: null };
+  it("shows a clear error when the supplier payment form receives a persistence failure", async () => {
+    useActionState.mockReturnValueOnce([{ error: "Le paiement fournisseur n’a pas été enregistré." }, formAction, false]);
+    const supplierInvoice = { ...invoices[0]!, invoiceType: "supplier" as const, supplierId: "supplier-1", customerId: null, paidAmount: 0 };
     render(<InvoiceManager companies={companies} invoices={[supplierInvoice]} loadError={null} />);
     fireEvent.click(screen.getByRole("button", { name: "Statut À payer pour FAC-100" }));
     fireEvent.click(screen.getByRole("button", { name: "Payée" }));
 
-    expect((await screen.findByRole("alert")).textContent).toContain("La mise à jour du statut a échoué.");
-    expect(screen.queryByText("Le statut de la facture a été mis à jour.")).toBeNull();
+    expect((await screen.findByRole("alert")).textContent).toContain("Le paiement fournisseur n’a pas été enregistré.");
+    expect(screen.queryByText("Le paiement fournisseur daté a été enregistré.")).toBeNull();
   });
 
   it("opens a source-document invoice as a manual form without invented extracted values", () => {
